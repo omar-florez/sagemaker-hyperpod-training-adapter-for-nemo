@@ -450,38 +450,73 @@ class SageMakerNLPBaseModel(ModelPT):
         return loss
 
     def _training_step_fp8(self, batch, batch_idx, *a, **kw):
-        fp8 = self._cfg.fp8
-        fp8_recipe = self.fp8_recipe
-        fp8_group = tsm.state.world_process_group
-        input_ids, _, labels = self._prepare_input_batch(batch, batch_idx)
-        with transformer_engine.pytorch.fp8_autocast(
-            enabled=fp8,
-            fp8_recipe=fp8_recipe,
-            fp8_group=fp8_group,
-        ):
-            return self(
-                *a,
-                input_ids=input_ids,
-                attention_mask=None,
-                labels=labels,
-                **kw,
-            )["loss"]
+            fp8 = self._cfg.fp8
+            fp8_recipe = self.fp8_recipe
+            fp8_group = tsm.state.world_process_group
+            input_ids, _, labels = self._prepare_input_batch(batch, batch_idx)
+            
+            # Check if sequence packing is enabled
+            use_packing = self._cfg.model.data.get("use_sequence_packing", False)
+            
+            with transformer_engine.pytorch.fp8_autocast(
+                enabled=fp8,
+                fp8_recipe=fp8_recipe,
+                fp8_group=fp8_group,
+            ):
+                if use_packing:
+                    # For packed sequences, compute custom loss with masking
+                    outputs = self(
+                        *a,
+                        input_ids=input_ids,
+                        attention_mask=None,
+                        labels=None,  # Don't use HF's built-in loss
+                        **kw,
+                    )
+                    logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+                    return self._compute_packed_sequence_loss(logits, labels)
+                else:
+                    # Standard FP8 training
+                    return self(
+                        *a,
+                        input_ids=input_ids,
+                        attention_mask=None,
+                        labels=labels,
+                        **kw,
+                    )["loss"]
 
     def _training_step(self, batch, batch_idx, *a, **kw):
-        if self._cfg.get("multi_modal", None):
-            return self(
-                *a,
-                **batch,
-                **kw,
-            )["loss"]
-        input_ids, _, labels = self._prepare_input_batch(batch, batch_idx)
-        return self(
-            *a,
-            input_ids=input_ids,
-            attention_mask=None,
-            labels=labels,
-            **kw,
-        )["loss"]
+            if self._cfg.get("multi_modal", None):
+                return self(
+                    *a,
+                    **batch,
+                    **kw,
+                )["loss"]
+            
+            input_ids, _, labels = self._prepare_input_batch(batch, batch_idx)
+            
+            # Check if sequence packing is enabled
+            use_packing = self._cfg.model.data.get("use_sequence_packing", False)
+            
+            if use_packing:
+                # For packed sequences, compute custom loss with masking
+                outputs = self(
+                    *a,
+                    input_ids=input_ids,
+                    attention_mask=None,
+                    labels=None,  # Don't use HF's built-in loss
+                    **kw,
+                )
+                logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+                return self._compute_packed_sequence_loss(logits, labels)
+            else:
+                # Standard training with HF's built-in loss
+                return self(
+                    *a,
+                    input_ids=input_ids,
+                    attention_mask=None,
+                    labels=labels,
+                    **kw,
+                )["loss"]
 
     def training_step(self, batch, batch_idx, *a, **kw):
         """
@@ -576,6 +611,40 @@ class SageMakerNLPBaseModel(ModelPT):
                 )
 
         return input_ids, _, labels
+    
+    def _compute_packed_sequence_loss(self, logits, labels):
+        """
+        Custom loss for packed sequences
+        """
+        # Step 1: Shift for next-token prediction
+        # [seq1][EOS][seq2][EOS] → predict next token
+        shift_logits = logits[..., :-1, :].contiguous()  # Remove last token
+        shift_labels = labels[..., 1:].contiguous()      # Remove first token
+        
+        # Step 2: Create mask to exclude EOS tokens
+        eos_token_id = 128001  # Llama's EOS token (or get from tokenizer)
+        loss_mask = (shift_labels != eos_token_id).float()
+        
+        # Example:
+        # labels:     [tok1, tok2, EOS, tok3, tok4, EOS]
+        # loss_mask:  [  1,    1,   0,    1,    1,   0]
+        #                         ↑                ↑
+        #                     Don't compute loss on EOS
+        
+        # Step 3: Compute loss per token (without reduction)
+        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+        loss = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),  # Flatten
+            shift_labels.view(-1)
+        )
+        # Shape: [batch * seq_len]
+        
+        # Step 4: Apply mask and compute mean
+        masked_loss = (loss * loss_mask.view(-1)).sum() / loss_mask.sum()
+        #              └─────────────────────────┘
+        #              Only include non-EOS tokens
+        
+        return masked_loss
 
     def setup_optimization(
         self,
