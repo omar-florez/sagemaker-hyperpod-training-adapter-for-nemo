@@ -40,10 +40,47 @@ class HuggingFaceDataModule(BaseDataModule):
     """
     Lightning DataModule for HuggingFace Pretraining dataset pipelining
     """
-
     def __init__(self, cfg: DictConfig, trainer: Trainer, collate_fn=None):
+        # Check if sequence packing is enabled
+        self.use_packing = cfg.model.data.get("use_sequence_packing", False)
+        self.tokenizer = None
+        
+        print("=" * 80)
+        print("SEQUENCE PACKING LOADED - Omar's Custom Code")
+        print(f"Training dir: {cfg.model.data.train_dir}")
+        print("=" * 80)
+        
         if collate_fn is None:
-            collate_fn = default_data_collator
+            if self.use_packing:
+                _logger.info("="*80)
+                _logger.info("--> SEQUENCE PACKING ENABLED")
+                _logger.info("="*80)
+                
+                from transformers import DataCollatorWithFlattening, AutoTokenizer
+                
+                # Get tokenizer
+                tokenizer_path = cfg.model.get("hf_model_name_or_path", "meta-llama/Llama-3.1-70B")
+                access_token = cfg.model.get("hf_access_token", None)
+                
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    tokenizer_path,
+                    token=access_token
+                )
+                
+                # Use DataCollatorWithFlattening for packed sequences
+                collate_fn = DataCollatorWithFlattening(
+                    tokenizer=self.tokenizer,
+                    return_position_ids=True,
+                    return_flash_attn_kwargs=True,
+                )
+                
+                _logger.info(f"   DataCollatorWithFlattening initialized")
+                _logger.info(f"   Tokenizer: {tokenizer_path}")
+                _logger.info(f"   EOS token: {self.tokenizer.eos_token_id}")
+            else:
+                collate_fn = default_data_collator
+                _logger.info("Using default data collator (no sequence packing)")
+        
         super().__init__(cfg=cfg, trainer=trainer, collate_fn=collate_fn)
 
     def train_dataloader(self):
@@ -91,3 +128,5 @@ class HuggingFaceMultiModalDataModule(HuggingFaceDataModule):
 
     def get_batch(self, data):
         return data["input_ids"], data["attention_mask"], data["pixel_values"], data["labels"]
+
+

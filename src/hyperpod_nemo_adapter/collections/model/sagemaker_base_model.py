@@ -616,34 +616,23 @@ class SageMakerNLPBaseModel(ModelPT):
         """
         Custom loss for packed sequences
         """
-        # Step 1: Shift for next-token prediction
-        # [seq1][EOS][seq2][EOS] → predict next token
         shift_logits = logits[..., :-1, :].contiguous()  # Remove last token
         shift_labels = labels[..., 1:].contiguous()      # Remove first token
         
-        # Step 2: Create mask to exclude EOS tokens
-        eos_token_id = 128001  # Llama's EOS token (or get from tokenizer)
+        # Get EOS token ID
+        if hasattr(self.trainer.datamodule, 'tokenizer') and self.trainer.datamodule.tokenizer is not None:
+            eos_token_id = self.trainer.datamodule.tokenizer.eos_token_id
+        else:
+            # Default for Llama models
+            eos_token_id = 2
         loss_mask = (shift_labels != eos_token_id).float()
         
-        # Example:
-        # labels:     [tok1, tok2, EOS, tok3, tok4, EOS]
-        # loss_mask:  [  1,    1,   0,    1,    1,   0]
-        #                         ↑                ↑
-        #                     Don't compute loss on EOS
-        
-        # Step 3: Compute loss per token (without reduction)
         loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
         loss = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)),  # Flatten
             shift_labels.view(-1)
         )
-        # Shape: [batch * seq_len]
-        
-        # Step 4: Apply mask and compute mean
         masked_loss = (loss * loss_mask.view(-1)).sum() / loss_mask.sum()
-        #              └─────────────────────────┘
-        #              Only include non-EOS tokens
-        
         return masked_loss
 
     def setup_optimization(
@@ -795,3 +784,4 @@ class SageMakerNLPBaseModel(ModelPT):
     def setup_validation_data(self):
         """We're using Data Module for data pipelining"""
         return None
+
