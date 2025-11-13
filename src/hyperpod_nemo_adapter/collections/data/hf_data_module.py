@@ -41,8 +41,31 @@ class HuggingFaceDataModule(BaseDataModule):
     Lightning DataModule for HuggingFace Pretraining dataset pipelining
     """
     def __init__(self, cfg: DictConfig, trainer: Trainer, collate_fn=None):
+        print("=" * 80)
+        print("DEBUG: Inside HuggingFaceDataModule.__init__")
+        print(f"Type of cfg: {type(cfg)}")
+        print(f"cfg keys: {cfg.keys() if hasattr(cfg, 'keys') else 'N/A'}")
+        
+        # Try different paths
+        print(f"\nTrying cfg.model.data:")
+        try:
+            print(f"  cfg.model.data = {cfg.model.data}")
+            print(f"  use_sequence_packing = {cfg.model.data.get('use_sequence_packing', 'NOT FOUND')}")
+        except Exception as e:
+            print(f"  ERROR: {e}")
+        
+        print(f"\nTrying cfg.data:")
+        try:
+            print(f"  cfg.data = {cfg.data if hasattr(cfg, 'data') else 'NO DATA ATTR'}")
+            if hasattr(cfg, 'data'):
+                print(f"  use_sequence_packing = {cfg.data.get('use_sequence_packing', 'NOT FOUND')}")
+        except Exception as e:
+            print(f"  ERROR: {e}")
+        
+        print("=" * 80)
+        
+        
         # Check if sequence packing is enabled
-        print(f"cfg:\n{cfg}")
         self.use_packing = cfg.model.data.get("use_sequence_packing", False)
         self.tokenizer = None
         
