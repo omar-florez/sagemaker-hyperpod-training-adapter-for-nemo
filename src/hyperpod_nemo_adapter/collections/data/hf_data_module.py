@@ -120,7 +120,7 @@ class HuggingFaceDataModule(BaseDataModule):
                 
                 _logger.info("="*80)
                 _logger.info("  Sequence packing enabled")
-                _logger.info(f" Tokenizer: {fg.model.get("hf_model_name_or_path")}")
+                _logger.info(f" Tokenizer: {cfg.model.get('hf_model_name_or_path')}")
                 _logger.info(f" EOS token: {self.tokenizer.eos_token_id}")
                 _logger.info("="*80)                
             else:
