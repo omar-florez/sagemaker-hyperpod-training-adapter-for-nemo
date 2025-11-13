@@ -133,7 +133,14 @@ class HuggingFaceDataModule(BaseDataModule):
                             doc_attention_mask[i, start_pos:end_pos, start_pos:end_pos] = causal_block
                     
                     batch["position_ids"] = position_ids
-                    batch["attention_mask"] = doc_attention_mask  # Document-level blocking
+                    #batch["attention_mask"] = doc_attention_mask  # Document-level blocking
+                    
+                    USE_BLOCK_DIAGONAL = False  #  Change to False to test
+                    if USE_BLOCK_DIAGONAL:
+                        batch["attention_mask"] = doc_attention_mask  # Current (hard boundaries)
+                    else:
+                        batch["attention_mask"] = torch.tensor([ex["attention_mask"] for ex in examples], dtype=torch.long)  # Simple padding mask
+                    
                     
                     # Create labels with proper masking
                     labels = batch["input_ids"].clone()
