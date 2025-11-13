@@ -76,9 +76,9 @@ class HuggingFaceDataModule(BaseDataModule):
                 EOS_TOKEN_ID = self.tokenizer.eos_token_id
                 
                 # ===== FEATURE FLAGS =====
-                USE_POSITION_RESET = False      # Toggle position ID resets
+                USE_POSITION_RESET = True      # Toggle position ID resets
                 USE_MASKED_LOSS = True          # Toggle loss masking for EOS/padding
-                USE_BLOCK_DIAGONAL = False      # Toggle document-level attention blocking
+                USE_BLOCK_DIAGONAL = True      # Toggle document-level attention blocking
                 
                 def collate_packed_sequences(examples):
                     """
@@ -181,6 +181,7 @@ class HuggingFaceDataModule(BaseDataModule):
                         print("  [INACTIVE] Loss masking disabled - using raw input_ids as labels")
                         # Use input_ids directly as labels (standard causal LM)
                         batch["labels"] = batch["input_ids"].clone()
+                    print('-'*30)
                     
                     return batch
                 
