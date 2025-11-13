@@ -26,16 +26,6 @@ from hyperpod_nemo_adapter.utils.log_utils import Logger
 
 _logger = Logger().get_logger()
 
-print("=" * 80)
-print(f"Flash Attention available: {torch.backends.cuda.flash_sdp_enabled()}")
-print(f"Transformers version: {transformers.__version__}")
-try:
-    import flash_attn
-    print(f"Flash Attention 2 installed: {flash_attn.__version__}")
-except ImportError:
-    print("Flash Attention 2 not installed")
-print("=" * 80)
-
 
 def mm_collate_fn(examples):
     lis = list(examples[0].keys())
@@ -56,15 +46,25 @@ class HuggingFaceDataModule(BaseDataModule):
         self.use_packing = use_packing_from_config if use_packing_from_config is not None else use_packing_from_env
         self.tokenizer = None
         
-        print("=" * 80)
-        print("SEQUENCE PACKING CONFIGURATION")
-        print(f"use_packing (config): {use_packing_from_config}")
-        print(f"use_packing (env): {use_packing_from_env}")
-        print(f"use_packing (final): {self.use_packing}")
-        print("=" * 80)
-        
         if collate_fn is None:
             if self.use_packing:
+                print("=" * 80)
+                print(f"Flash Attention available: {torch.backends.cuda.flash_sdp_enabled()}")
+                print(f"Transformers version: {transformers.__version__}")
+                try:
+                    import flash_attn
+                    print(f"Flash Attention 2 installed: {flash_attn.__version__}")
+                except ImportError:
+                    print("Flash Attention 2 not installed")
+                print("=" * 80)
+                
+                print("=" * 80)
+                print("SEQUENCE PACKING CONFIGURATION")
+                print(f"use_packing (config): {use_packing_from_config}")
+                print(f"use_packing (env): {use_packing_from_env}")
+                print(f"use_packing (final): {self.use_packing}")
+                print("=" * 80)
+                
                 from transformers import AutoTokenizer
                 
                 self.tokenizer = AutoTokenizer.from_pretrained(
