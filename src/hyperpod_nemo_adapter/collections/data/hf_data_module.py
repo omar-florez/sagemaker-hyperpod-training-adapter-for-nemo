@@ -57,10 +57,10 @@ class HuggingFaceDataModule(BaseDataModule):
         self.tokenizer = None
         
         print("=" * 80)
-        print("SEQUENCE PACKING")
+        print("SEQUENCE PACKING CONFIGURATION")
         print(f"use_packing (config): {use_packing_from_config}")
         print(f"use_packing (env): {use_packing_from_env}")
-        print(f"use_packing: {self.use_packing}")
+        print(f"use_packing (final): {self.use_packing}")
         print("=" * 80)
         
         if collate_fn is None:
@@ -75,13 +75,17 @@ class HuggingFaceDataModule(BaseDataModule):
                 IGNORE_INDEX = -100  # PyTorch CrossEntropyLoss convention
                 EOS_TOKEN_ID = self.tokenizer.eos_token_id
                 
+                # ===== FEATURE FLAGS =====
+                USE_POSITION_RESET = False      # Toggle position ID resets
+                USE_MASKED_LOSS = True          # Toggle loss masking for EOS/padding
+                USE_BLOCK_DIAGONAL = False      # Toggle document-level attention blocking
+                
                 def collate_packed_sequences(examples):
                     """
-                    Collator for pre-packed sequences with:
-                    - Position ID resets at document boundaries
-                    - Padding masking
-                    - Loss masking for EOS and padding
-                    - Optional document-level attention blocking
+                    Collator for pre-packed sequences with configurable features:
+                    - Position ID resets at document boundaries (USE_POSITION_RESET)
+                    - Loss masking for EOS and padding (USE_MASKED_LOSS)
+                    - Document-level attention blocking (USE_BLOCK_DIAGONAL)
                     """
                     batch = {
                         "input_ids": torch.tensor([ex["input_ids"] for ex in examples], dtype=torch.long),
@@ -89,84 +93,120 @@ class HuggingFaceDataModule(BaseDataModule):
                     }
                     
                     batch_size, seq_len = batch["input_ids"].shape
-                    position_ids = torch.zeros_like(batch["input_ids"])
                     
-                    # Generate document-level block diagonal attention mask
-                    # This prevents cross-document attention
-                    doc_attention_mask = torch.zeros((batch_size, seq_len, seq_len), dtype=torch.bool)
-                    
-                    for i in range(batch_size):
-                        input_ids = batch["input_ids"][i]
-                        attention_mask = batch["attention_mask"][i]
+                    # ===== FEATURE 1: POSITION ID RESETS =====
+                    if USE_POSITION_RESET:
+                        print("  [ACTIVE] Generating position IDs with resets at EOS boundaries")
+                        position_ids = torch.zeros_like(batch["input_ids"])
                         
-                        # Find real content length (where padding starts)
-                        real_content_length = attention_mask.sum().item()
-                        real_input_ids = input_ids[:real_content_length]
-                        
-                        # Find EOS positions in real content
-                        eos_mask = (real_input_ids == EOS_TOKEN_ID)
-                        eos_positions = eos_mask.nonzero(as_tuple=True)[0].tolist()
-                        
-                        # Generate position IDs with resets at EOS boundaries
-                        last_eos = -1
-                        for eos_pos in eos_positions:
-                            length = eos_pos - last_eos
-                            position_ids[i, last_eos+1:eos_pos+1] = torch.arange(length)
-                            last_eos = eos_pos
-                        
-                        # Fill remaining real content after last EOS
-                        if last_eos < real_content_length - 1:
-                            length = real_content_length - last_eos - 1
-                            position_ids[i, last_eos+1:real_content_length] = torch.arange(length)
-                        
-                        # Create document-level attention blocks
-                        # Each document can only attend to itself (block diagonal mask)
-                        doc_boundaries = [-1] + eos_positions + [real_content_length - 1]
-                        
-                        for doc_start, doc_end in zip(doc_boundaries[:-1], doc_boundaries[1:]):
-                            start_pos = doc_start + 1
-                            end_pos = doc_end + 1
+                        for i in range(batch_size):
+                            input_ids = batch["input_ids"][i]
+                            attention_mask = batch["attention_mask"][i]
                             
-                            # Create causal mask within this document block
-                            doc_len = end_pos - start_pos
-                            causal_block = torch.tril(torch.ones((doc_len, doc_len), dtype=torch.bool))
-                            doc_attention_mask[i, start_pos:end_pos, start_pos:end_pos] = causal_block
+                            # Find real content length
+                            real_content_length = attention_mask.sum().item()
+                            real_input_ids = input_ids[:real_content_length]
+                            
+                            # Find EOS positions in real content
+                            eos_mask = (real_input_ids == EOS_TOKEN_ID)
+                            eos_positions = eos_mask.nonzero(as_tuple=True)[0].tolist()
+                            
+                            # Generate position IDs with resets at EOS boundaries
+                            last_eos = -1
+                            for eos_pos in eos_positions:
+                                length = eos_pos - last_eos
+                                position_ids[i, last_eos+1:eos_pos+1] = torch.arange(length)
+                                last_eos = eos_pos
+                            
+                            # Fill remaining real content after last EOS
+                            if last_eos < real_content_length - 1:
+                                length = real_content_length - last_eos - 1
+                                position_ids[i, last_eos+1:real_content_length] = torch.arange(length)
+                        
+                        batch["position_ids"] = position_ids
+                    else:
+                        print("  [INACTIVE] Position resets disabled - using default continuous positions")
+                        # Don't add position_ids to batch
+                        # Model will generate default continuous positions [0, 1, 2, ...]
                     
-                    batch["position_ids"] = position_ids
-                    
-                    # Toggle between block diagonal and simple padding mask
-                    USE_BLOCK_DIAGONAL = False  # Change to True to enable document isolation
-                    
+                    # ===== FEATURE 2: BLOCK DIAGONAL ATTENTION =====
                     if USE_BLOCK_DIAGONAL:
+                        print("  [ACTIVE] Generating document-level block diagonal attention mask")
+                        doc_attention_mask = torch.zeros((batch_size, seq_len, seq_len), dtype=torch.bool)
+                        
+                        for i in range(batch_size):
+                            input_ids = batch["input_ids"][i]
+                            attention_mask = batch["attention_mask"][i]
+                            
+                            # Find real content length
+                            real_content_length = attention_mask.sum().item()
+                            real_input_ids = input_ids[:real_content_length]
+                            
+                            # Find EOS positions in real content
+                            eos_mask = (real_input_ids == EOS_TOKEN_ID)
+                            eos_positions = eos_mask.nonzero(as_tuple=True)[0].tolist()
+                            
+                            # Create document-level attention blocks
+                            doc_boundaries = [-1] + eos_positions + [real_content_length - 1]
+                            
+                            for doc_start, doc_end in zip(doc_boundaries[:-1], doc_boundaries[1:]):
+                                start_pos = doc_start + 1
+                                end_pos = doc_end + 1
+                                
+                                # Create causal mask within this document block
+                                doc_len = end_pos - start_pos
+                                causal_block = torch.tril(torch.ones((doc_len, doc_len), dtype=torch.bool))
+                                doc_attention_mask[i, start_pos:end_pos, start_pos:end_pos] = causal_block
+                        
                         batch["attention_mask"] = doc_attention_mask  # 3D block diagonal mask
                     else:
-                        # Use simple 2D padding mask (already in batch from line 22)
-                        pass
+                        print("  [INACTIVE] Block diagonal disabled - using simple 2D padding mask")
+                        # Keep the original 2D attention mask (already in batch)
+                        # batch["attention_mask"] is already set from line 22
                     
-                    # ===== CORRECTED LABEL MASKING =====
-                    labels = batch["input_ids"].clone()
-                    
-                    # 1. Mask REAL EOS tokens first (document boundaries where attention_mask == 1)
-                    real_eos_mask = (batch["input_ids"] == EOS_TOKEN_ID) & (batch["attention_mask"] == 1)
-                    labels[real_eos_mask] = IGNORE_INDEX
-                    
-                    # 2. Mask padding tokens (where attention_mask == 0)
-                    labels[batch["attention_mask"] == 0] = IGNORE_INDEX
-                    
-                    batch["labels"] = labels
+                    # ===== FEATURE 3: MASKED LOSS =====
+                    if USE_MASKED_LOSS:
+                        print("  [ACTIVE] Masking loss for EOS tokens and padding")
+                        labels = batch["input_ids"].clone()
+                        
+                        # Mask REAL EOS tokens first (document boundaries where attention_mask == 1)
+                        real_eos_mask = (batch["input_ids"] == EOS_TOKEN_ID) & (batch["attention_mask"] == 1)
+                        labels[real_eos_mask] = IGNORE_INDEX
+                        
+                        # Mask padding tokens (where attention_mask == 0)
+                        labels[batch["attention_mask"] == 0] = IGNORE_INDEX
+                        
+                        batch["labels"] = labels
+                    else:
+                        print("  [INACTIVE] Loss masking disabled - using raw input_ids as labels")
+                        # Use input_ids directly as labels (standard causal LM)
+                        batch["labels"] = batch["input_ids"].clone()
                     
                     return batch
                 
                 collate_fn = collate_packed_sequences
                 
+                # ===== LOGGING CONFIGURATION =====
                 _logger.info("="*80)
                 _logger.info("SEQUENCE PACKING ENABLED")
                 _logger.info(f" Tokenizer: {cfg.model.get('hf_model_name_or_path')}")
-                _logger.info(f" EOS token: {self.tokenizer.eos_token_id}")
-                _logger.info("  Features:")
-                _logger.info("      Position IDs reset at document boundaries")
-                _logger.info(f"     Document-level attention blocking: {False}")  # Update if you change USE_BLOCK_DIAGONAL
-                _logger.info("      Loss masking for EOS and padding")
+                _logger.info(f" EOS token ID: {self.tokenizer.eos_token_id}")
+                _logger.info("")
+                _logger.info("  Active Features:")
+                if USE_POSITION_RESET:
+                    _logger.info("    Position ID resets at document boundaries")
+                else:
+                    _logger.info("    Position ID resets (using continuous positions)")
+                
+                if USE_BLOCK_DIAGONAL:
+                    _logger.info("    Document-level block diagonal attention masking")
+                else:
+                    _logger.info("    Block diagonal attention (using simple padding mask)")
+                
+                if USE_MASKED_LOSS:
+                    _logger.info("    Loss masking for EOS and padding tokens")
+                else:
+                    _logger.info("    Loss masking (using all tokens for loss)")
                 _logger.info("="*80)
             else:
                 collate_fn = default_data_collator
