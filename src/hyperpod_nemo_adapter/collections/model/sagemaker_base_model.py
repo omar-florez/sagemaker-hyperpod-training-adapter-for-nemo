@@ -450,73 +450,62 @@ class SageMakerNLPBaseModel(ModelPT):
         return loss
 
     def _training_step_fp8(self, batch, batch_idx, *a, **kw):
-            fp8 = self._cfg.fp8
-            fp8_recipe = self.fp8_recipe
-            fp8_group = tsm.state.world_process_group
-            input_ids, _, labels = self._prepare_input_batch(batch, batch_idx)
+        fp8 = self._cfg.fp8
+        fp8_recipe = self.fp8_recipe
+        fp8_group = tsm.state.world_process_group
+        
+        input_ids, attention_mask, labels, position_ids = self._prepare_input_batch(batch, batch_idx)
+        
+        # Check if sequence packing is enabled
+        use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
+        
+        with transformer_engine.pytorch.fp8_autocast(
+            enabled=fp8,
+            fp8_recipe=fp8_recipe,
+            fp8_group=fp8_group,
+        ):
+            forward_kwargs = {
+                "input_ids": input_ids,
+                "labels": labels,
+            }
             
-            # Check if sequence packing is enabled
-            use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
+            # Only add optional parameters if they exist
+            if use_packing:
+                if attention_mask is not None:
+                    forward_kwargs["attention_mask"] = attention_mask
+                if position_ids is not None:
+                    forward_kwargs["position_ids"] = position_ids
+            else:
+                # Standard mode: attention_mask=None (default causal)
+                forward_kwargs["attention_mask"] = None
             
-            with transformer_engine.pytorch.fp8_autocast(
-                enabled=fp8,
-                fp8_recipe=fp8_recipe,
-                fp8_group=fp8_group,
-            ):
-                if use_packing:
-                    # For packed sequences, compute custom loss with masking
-                    outputs = self(
-                        *a,
-                        input_ids=input_ids,
-                        attention_mask=None,
-                        labels=None,  # Don't use HF's built-in loss
-                        **kw,
-                    )
-                    logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
-                    return self._compute_packed_sequence_loss(logits, labels)
-                else:
-                    # Standard FP8 training
-                    return self(
-                        *a,
-                        input_ids=input_ids,
-                        attention_mask=None,
-                        labels=labels,
-                        **kw,
-                    )["loss"]
+            return self(*a, **forward_kwargs, **kw)["loss"]
 
     def _training_step(self, batch, batch_idx, *a, **kw):
-            if self._cfg.get("multi_modal", None):
-                return self(
-                    *a,
-                    **batch,
-                    **kw,
-                )["loss"]
-            
-            input_ids, _, labels = self._prepare_input_batch(batch, batch_idx)
-            
-            # Check if sequence packing is enabled
-            use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
-            
-            if use_packing:
-                # For packed sequences, compute custom loss with masking
-                outputs = self(
-                    *a,
-                    input_ids=input_ids,
-                    attention_mask=None,
-                    labels=None,  # Don't use HF's built-in loss
-                    **kw,
-                )
-                logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
-                return self._compute_packed_sequence_loss(logits, labels)
-            else:
-                # Standard training with HF's built-in loss
-                return self(
-                    *a,
-                    input_ids=input_ids,
-                    attention_mask=None,
-                    labels=labels,
-                    **kw,
-                )["loss"]
+        if self._cfg.get("multi_modal", None):
+            return self(*a, **batch, **kw)["loss"]
+        
+        input_ids, attention_mask, labels, position_ids = self._prepare_input_batch(batch, batch_idx)
+        
+        # Check if sequence packing is enabled
+        use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
+        
+        forward_kwargs = {
+            "input_ids": input_ids,
+            "labels": labels,
+        }
+        
+        # Only add optional parameters if they exist
+        if use_packing:
+            if attention_mask is not None:
+                forward_kwargs["attention_mask"] = attention_mask
+            if position_ids is not None:
+                forward_kwargs["position_ids"] = position_ids
+        else:
+            # Standard mode: attention_mask=None (default causal)
+            forward_kwargs["attention_mask"] = None
+        
+        return self(*a, **forward_kwargs, **kw)["loss"]
 
     def training_step(self, batch, batch_idx, *a, **kw):
         """
@@ -532,9 +521,7 @@ class SageMakerNLPBaseModel(ModelPT):
         return self.loss
 
     def validation_step(self, batch, batch_idx):
-        """
-        Validation step
-        """
+        """Validation step"""
         if self._cfg.get("dpo", False):
             prompt_ids, prompt_mask, chosen_ids, chosen_mask, rejected_ids, rejected_mask = (
                 self._prepare_dpo_input_batch(batch, batch_idx)
@@ -556,12 +543,28 @@ class SageMakerNLPBaseModel(ModelPT):
             }
             val_loss = compute_dpo_loss(**dpo_params)
         else:
-            input_ids, _, labels = self._prepare_input_batch(batch, batch_idx)
-            val_loss = self(
-                input_ids=input_ids,
-                attention_mask=None,
-                labels=labels,
-            )["loss"]
+            input_ids, attention_mask, labels, position_ids = self._prepare_input_batch(batch, batch_idx)
+            
+            # Check if sequence packing is enabled
+            use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
+            
+            forward_kwargs = {
+                "input_ids": input_ids,
+                "labels": labels,
+            }
+            
+            # Only add optional parameters if they exist
+            if use_packing:
+                if attention_mask is not None:
+                    forward_kwargs["attention_mask"] = attention_mask
+                if position_ids is not None:
+                    forward_kwargs["position_ids"] = position_ids
+            else:
+                # Standard mode: attention_mask=None (default causal)
+                forward_kwargs["attention_mask"] = None
+            
+            val_loss = self(**forward_kwargs)["loss"]
+        
         self.val_loss += val_loss.detach()
         return val_loss
 
@@ -593,12 +596,45 @@ class SageMakerNLPBaseModel(ModelPT):
     def _prepare_input_batch(self, batch, batch_idx):
         """
         Parse input batch, pre-process for context parallel
+        Supports both:
+        - Standard mode: (input_ids, attention_mask, labels)
+        - Sequence packing mode: (input_ids, attention_mask, labels, position_ids)
         """
-        input_ids, _, labels = self.trainer.datamodule.get_batch(batch)
+        # Check if sequence packing is enabled
+        use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
+        
+        batch_data = self.trainer.datamodule.get_batch(batch)
+        
+        if use_packing and len(batch_data) == 4:
+            # Sequence packing mode: extract all 4 components
+            input_ids, attention_mask, labels, position_ids = batch_data
+        elif len(batch_data) == 3:
+            # Standard mode: only 3 components
+            input_ids, attention_mask, labels = batch_data
+            position_ids = None
+        else:
+            # Fallback for legacy format where attention_mask might be ignored
+            input_ids, _, labels = batch_data
+            attention_mask = None
+            position_ids = None
+        
         self.batch_num_sequences = input_ids.shape[0]
+        
         if self._cfg.get("context_parallel_degree", 1) > 1:
-            input_ids, labels = get_batch_for_cp_rank((input_ids, labels))
-
+            if use_packing and position_ids is not None:
+                # Pack all components for context parallel
+                input_ids, attention_mask, labels, position_ids = get_batch_for_cp_rank(
+                    (input_ids, attention_mask, labels, position_ids)
+                )
+            elif attention_mask is not None:
+                # Pack with attention mask but no position_ids
+                input_ids, attention_mask, labels = get_batch_for_cp_rank(
+                    (input_ids, attention_mask, labels)
+                )
+            else:
+                # Legacy: only input_ids and labels
+                input_ids, labels = get_batch_for_cp_rank((input_ids, labels))
+        
         if batch_idx == 0 and dist.get_rank() == 0:
             # checking only on batch 0 to reduce checks during runtime
             if (self._cfg.get("context_parallel_degree", 1) > 1) & (
@@ -609,8 +645,8 @@ class SageMakerNLPBaseModel(ModelPT):
                     f"If context parallelism is enabled, input_ids sequence length should be "
                     f"(model.max_context_width / model.context_parallel_degree)."
                 )
-
-        return input_ids, _, labels
+        
+        return input_ids, attention_mask, labels, position_ids
     
     def _compute_packed_sequence_loss(self, logits, labels):
         """

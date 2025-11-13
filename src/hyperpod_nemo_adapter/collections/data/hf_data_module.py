@@ -15,6 +15,7 @@ import torch
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer
 from transformers import default_data_collator
+import transformers
 
 from hyperpod_nemo_adapter.collections.data.base import BaseDataModule
 from hyperpod_nemo_adapter.collections.data.datasets import (
@@ -25,17 +26,16 @@ from hyperpod_nemo_adapter.utils.log_utils import Logger
 
 _logger = Logger().get_logger()
 
-import transformers
 print("=" * 80)
 print(f"Flash Attention available: {torch.backends.cuda.flash_sdp_enabled()}")
 print(f"Transformers version: {transformers.__version__}")
-# Check if FA2 is installed
 try:
     import flash_attn
     print(f"Flash Attention 2 installed: {flash_attn.__version__}")
 except ImportError:
     print("Flash Attention 2 not installed")
 print("=" * 80)
+
 
 def mm_collate_fn(examples):
     lis = list(examples[0].keys())
@@ -50,7 +50,6 @@ def mm_collate_fn(examples):
 
 class HuggingFaceDataModule(BaseDataModule):
     def __init__(self, cfg: DictConfig, trainer: Trainer, collate_fn=None):
-        # Try config first, then fall back to env var
         use_packing_from_config = cfg.model.data.get("use_sequence_packing", None)
         use_packing_from_env = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
         
@@ -58,15 +57,14 @@ class HuggingFaceDataModule(BaseDataModule):
         self.tokenizer = None
         
         print("=" * 80)
-        print("SEQUENCE PACKING LOADED - Omar's Custom Code")
-        print(f"Training dir: {cfg.model.data.train_dir}")
-        print(f"use_packing (from config): {use_packing_from_config}")
-        print(f"use_packing (from env): {use_packing_from_env}")
-        print(f"use_packing (final): {self.use_packing}")
+        print("SEQUENCE PACKING")
+        print(f"use_packing (config): {use_packing_from_config}")
+        print(f"use_packing (env): {use_packing_from_env}")
+        print(f"use_packing: {use_packing}")
         print("=" * 80)
         
         if collate_fn is None:
-            if self.use_packing:                
+            if self.use_packing:
                 from transformers import AutoTokenizer
                 
                 self.tokenizer = AutoTokenizer.from_pretrained(
@@ -74,32 +72,94 @@ class HuggingFaceDataModule(BaseDataModule):
                     token=cfg.model.get("hf_access_token")
                 )
                 
-                # PyTorch CrossEntropyLoss convention
-                IGNORE_INDEX = -100  
+                IGNORE_INDEX = -100  # PyTorch CrossEntropyLoss convention
                 EOS_TOKEN_ID = self.tokenizer.eos_token_id
                 
                 def collate_packed_sequences(examples):
+                    """
+                    Collator for pre-packed sequences with:
+                    - Position ID resets at document boundaries
+                    - Padding masking
+                    - Loss masking for EOS and padding
+                    - Document-level attention blocking (prevents cross-doc attention)
+                    """
                     batch = {
                         "input_ids": torch.tensor([ex["input_ids"] for ex in examples], dtype=torch.long),
                         "attention_mask": torch.tensor([ex["attention_mask"] for ex in examples], dtype=torch.long),
                     }
+                    
+                    batch_size, seq_len = batch["input_ids"].shape
+                    position_ids = torch.zeros_like(batch["input_ids"])
+                    
+                    # Generate document-level block diagonal attention mask
+                    # This prevents cross-document attention
+                    doc_attention_mask = torch.zeros((batch_size, seq_len, seq_len), dtype=torch.bool)
+                    
+                    for i in range(batch_size):
+                        input_ids = batch["input_ids"][i]
+                        attention_mask = batch["attention_mask"][i]
+                        
+                        # Find real content length (where padding starts)
+                        real_content_length = attention_mask.sum().item()
+                        real_input_ids = input_ids[:real_content_length]
+                        
+                        # Find EOS positions in real content
+                        eos_mask = (real_input_ids == EOS_TOKEN_ID)
+                        eos_positions = eos_mask.nonzero(as_tuple=True)[0].tolist()
+                        
+                        # Generate position IDs with resets at EOS boundaries
+                        last_eos = -1
+                        for eos_pos in eos_positions:
+                            length = eos_pos - last_eos
+                            position_ids[i, last_eos+1:eos_pos+1] = torch.arange(length)
+                            last_eos = eos_pos
+                        
+                        # Fill remaining real content after last EOS
+                        if last_eos < real_content_length - 1:
+                            length = real_content_length - last_eos - 1
+                            position_ids[i, last_eos+1:real_content_length] = torch.arange(length)
+                        
+                        # Create document-level attention blocks
+                        # Each document can only attend to itself (block diagonal mask)
+                        doc_boundaries = [-1] + eos_positions + [real_content_length - 1]
+                        
+                        for doc_start, doc_end in zip(doc_boundaries[:-1], doc_boundaries[1:]):
+                            start_pos = doc_start + 1
+                            end_pos = doc_end + 1
+                            
+                            # Create causal mask within this document block
+                            doc_len = end_pos - start_pos
+                            causal_block = torch.tril(torch.ones((doc_len, doc_len), dtype=torch.bool))
+                            doc_attention_mask[i, start_pos:end_pos, start_pos:end_pos] = causal_block
+                    
+                    batch["position_ids"] = position_ids
+                    batch["attention_mask"] = doc_attention_mask  # Document-level blocking
+                    
+                    # Create labels with proper masking
                     labels = batch["input_ids"].clone()
-                    # Mask padding tokens (where attention_mask == 0)
-                    labels[batch["attention_mask"] == 0] = IGNORE_INDEX
-                    # Prevents the model from learning to predict tokens after a document ends enforcing  
-                    # document boundaries so the model doesn't hallucinate relationships between unrelated 
-                    # documents: P(tok | document_context)
+                    
+                    # Mask padding tokens (where original attention_mask == 0)
+                    padding_mask = torch.tensor([ex["attention_mask"] for ex in examples], dtype=torch.long)
+                    labels[padding_mask == 0] = IGNORE_INDEX
+                    
+                    # Mask EOS tokens (document boundaries)
                     labels[labels == EOS_TOKEN_ID] = IGNORE_INDEX
+                    
                     batch["labels"] = labels
+                    
                     return batch
                 
                 collate_fn = collate_packed_sequences
                 
                 _logger.info("="*80)
-                _logger.info("  Sequence packing enabled")
+                _logger.info("SEQUENCE PACKING ENABLED")
                 _logger.info(f" Tokenizer: {cfg.model.get('hf_model_name_or_path')}")
                 _logger.info(f" EOS token: {self.tokenizer.eos_token_id}")
-                _logger.info("="*80)                
+                _logger.info("  Features:")
+                _logger.info("      Position IDs reset at document boundaries")
+                _logger.info("      Document-level attention blocking")
+                _logger.info("      Loss masking for EOS and padding")
+                _logger.info("="*80)
             else:
                 collate_fn = default_data_collator
                 _logger.info("Using default data collator (no sequence packing)")
@@ -121,6 +181,14 @@ class HuggingFaceDataModule(BaseDataModule):
         return self._build_dataloader(self._validation_ds, batch_size=self.cfg.model.val_batch_size)
 
     def get_batch(self, data):
+        """Extract batch data including position_ids"""
+        if "position_ids" in data:
+            return (
+                data["input_ids"], 
+                data["attention_mask"], 
+                data["labels"],
+                data["position_ids"]
+            )
         return data["input_ids"], data["attention_mask"], data["labels"]
 
     def get_val_batch(self, data):
@@ -128,9 +196,7 @@ class HuggingFaceDataModule(BaseDataModule):
 
 
 class HuggingFaceMultiModalDataModule(HuggingFaceDataModule):
-    """
-    Lightning DataModule for HuggingFace Pretraining dataset pipelining
-    """
+    """Lightning DataModule for HuggingFace Pretraining dataset pipelining"""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer):
         super().__init__(cfg=cfg, trainer=trainer, collate_fn=mm_collate_fn)
@@ -151,5 +217,3 @@ class HuggingFaceMultiModalDataModule(HuggingFaceDataModule):
 
     def get_batch(self, data):
         return data["input_ids"], data["attention_mask"], data["pixel_values"], data["labels"]
-
-
