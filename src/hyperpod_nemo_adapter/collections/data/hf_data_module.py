@@ -81,7 +81,7 @@ class HuggingFaceDataModule(BaseDataModule):
                     - Position ID resets at document boundaries
                     - Padding masking
                     - Loss masking for EOS and padding
-                    - Document-level attention blocking (prevents cross-doc attention)
+                    - Optional document-level attention blocking
                     """
                     batch = {
                         "input_ids": torch.tensor([ex["input_ids"] for ex in examples], dtype=torch.long),
@@ -133,24 +133,25 @@ class HuggingFaceDataModule(BaseDataModule):
                             doc_attention_mask[i, start_pos:end_pos, start_pos:end_pos] = causal_block
                     
                     batch["position_ids"] = position_ids
-                    #batch["attention_mask"] = doc_attention_mask  # Document-level blocking
                     
-                    USE_BLOCK_DIAGONAL = False  #  Change to False to test
+                    # Toggle between block diagonal and simple padding mask
+                    USE_BLOCK_DIAGONAL = False  # Change to True to enable document isolation
+                    
                     if USE_BLOCK_DIAGONAL:
-                        batch["attention_mask"] = doc_attention_mask  # Current (hard boundaries)
+                        batch["attention_mask"] = doc_attention_mask  # 3D block diagonal mask
                     else:
-                        batch["attention_mask"] = torch.tensor([ex["attention_mask"] for ex in examples], dtype=torch.long)  # Simple padding mask
+                        # Use simple 2D padding mask (already in batch from line 22)
+                        pass
                     
-                    
-                    # Create labels with proper masking
+                    # ===== CORRECTED LABEL MASKING =====
                     labels = batch["input_ids"].clone()
                     
-                    # Mask padding tokens (where original attention_mask == 0)
-                    padding_mask = torch.tensor([ex["attention_mask"] for ex in examples], dtype=torch.long)
-                    labels[padding_mask == 0] = IGNORE_INDEX
+                    # 1. Mask REAL EOS tokens first (document boundaries where attention_mask == 1)
+                    real_eos_mask = (batch["input_ids"] == EOS_TOKEN_ID) & (batch["attention_mask"] == 1)
+                    labels[real_eos_mask] = IGNORE_INDEX
                     
-                    # Mask EOS tokens (document boundaries)
-                    labels[labels == EOS_TOKEN_ID] = IGNORE_INDEX
+                    # 2. Mask padding tokens (where attention_mask == 0)
+                    labels[batch["attention_mask"] == 0] = IGNORE_INDEX
                     
                     batch["labels"] = labels
                     
@@ -164,7 +165,7 @@ class HuggingFaceDataModule(BaseDataModule):
                 _logger.info(f" EOS token: {self.tokenizer.eos_token_id}")
                 _logger.info("  Features:")
                 _logger.info("      Position IDs reset at document boundaries")
-                _logger.info("      Document-level attention blocking")
+                _logger.info(f"     Document-level attention blocking: {False}")  # Update if you change USE_BLOCK_DIAGONAL
                 _logger.info("      Loss masking for EOS and padding")
                 _logger.info("="*80)
             else:
