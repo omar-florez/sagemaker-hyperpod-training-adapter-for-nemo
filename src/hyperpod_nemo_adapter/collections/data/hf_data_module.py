@@ -42,7 +42,8 @@ class HuggingFaceDataModule(BaseDataModule):
     """
     def __init__(self, cfg: DictConfig, trainer: Trainer, collate_fn=None):
         # Check if sequence packing is enabled
-        self.use_packing = cfg.model.data.get("use_sequence_packing", False)
+        print(f"cfg:\n{cfg}")
+        self.use_packing = cfg.data.get("use_sequence_packing", False)
         self.tokenizer = None
         
         print("=" * 80)
