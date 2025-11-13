@@ -25,6 +25,7 @@ from hyperpod_nemo_adapter.utils.log_utils import Logger
 
 _logger = Logger().get_logger()
 
+import transformers
 print("=" * 80)
 print(f"Flash Attention available: {torch.backends.cuda.flash_sdp_enabled()}")
 print(f"Transformers version: {transformers.__version__}")
@@ -65,30 +66,6 @@ class HuggingFaceDataModule(BaseDataModule):
         print("=" * 80)
         
         if collate_fn is None:
-            if self.use_packing:
-                _logger.info("="*80)
-                _logger.info("--> SEQUENCE PACKING ENABLED")
-                _logger.info("="*80)
-                
-                from transformers import DataCollatorWithFlattening, AutoTokenizer
-                
-                tokenizer_path = cfg.model.get("hf_model_name_or_path", "meta-llama/Llama-3.1-70B")
-                access_token = cfg.model.get("hf_access_token", None)
-                
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    tokenizer_path,
-                    token=access_token
-                )
-                
-                collate_fn = DataCollatorWithFlattening(
-                    tokenizer=self.tokenizer,
-                    return_position_ids=True,
-                    return_flash_attn_kwargs=True,
-                )
-                
-                _logger.info(f"   DataCollatorWithFlattening initialized")
-                _logger.info(f"   Tokenizer: {tokenizer_path}")
-                _logger.info(f"   EOS token: {self.tokenizer.eos_token_id}")
             if self.use_packing:                
                 from transformers import AutoTokenizer
                 
