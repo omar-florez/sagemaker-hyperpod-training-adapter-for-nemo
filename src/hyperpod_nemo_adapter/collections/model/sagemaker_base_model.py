@@ -456,7 +456,7 @@ class SageMakerNLPBaseModel(ModelPT):
             input_ids, _, labels = self._prepare_input_batch(batch, batch_idx)
             
             # Check if sequence packing is enabled
-            use_packing = self._cfg.model.data.get("use_sequence_packing", False)
+            use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
             
             with transformer_engine.pytorch.fp8_autocast(
                 enabled=fp8,
@@ -495,7 +495,7 @@ class SageMakerNLPBaseModel(ModelPT):
             input_ids, _, labels = self._prepare_input_batch(batch, batch_idx)
             
             # Check if sequence packing is enabled
-            use_packing = self._cfg.model.data.get("use_sequence_packing", False)
+            use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
             
             if use_packing:
                 # For packed sequences, compute custom loss with masking
