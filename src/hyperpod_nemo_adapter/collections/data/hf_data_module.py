@@ -76,9 +76,9 @@ class HuggingFaceDataModule(BaseDataModule):
                 EOS_TOKEN_ID = self.tokenizer.eos_token_id
                 
                 # ===== FEATURE FLAGS =====
-                USE_POSITION_RESET = True      # Toggle position ID resets
+                USE_POSITION_RESET = True       # Toggle position ID resets
                 USE_MASKED_LOSS = True          # Toggle loss masking for EOS/padding
-                USE_BLOCK_DIAGONAL = True      # Toggle document-level attention blocking
+                USE_BLOCK_DIAGONAL = False      # Toggle document-level attention blocking
                 
                 def collate_packed_sequences(examples):
                     """
@@ -87,21 +87,27 @@ class HuggingFaceDataModule(BaseDataModule):
                     - Loss masking for EOS and padding (USE_MASKED_LOSS)
                     - Document-level attention blocking (USE_BLOCK_DIAGONAL)
                     """
+                    # Store original 2D attention mask (needed for label masking)
+                    original_attention_mask = torch.tensor([ex["attention_mask"] for ex in examples], dtype=torch.long)
+                    
                     batch = {
                         "input_ids": torch.tensor([ex["input_ids"] for ex in examples], dtype=torch.long),
-                        "attention_mask": torch.tensor([ex["attention_mask"] for ex in examples], dtype=torch.long),
+                        "attention_mask": original_attention_mask.clone(),  # Will be overwritten if block diagonal
                     }
                     
                     batch_size, seq_len = batch["input_ids"].shape
                     
                     # ===== FEATURE 1: POSITION ID RESETS =====
                     if USE_POSITION_RESET:
-                        print("  [ACTIVE] Generating position IDs with resets at EOS boundaries")
+                        if not hasattr(collate_packed_sequences, '_logged_pos_reset'):
+                            print("  [ACTIVE] Generating position IDs with resets at EOS boundaries")
+                            collate_packed_sequences._logged_pos_reset = True
+                        
                         position_ids = torch.zeros_like(batch["input_ids"])
                         
                         for i in range(batch_size):
                             input_ids = batch["input_ids"][i]
-                            attention_mask = batch["attention_mask"][i]
+                            attention_mask = original_attention_mask[i]  # Use original 2D mask
                             
                             # Find real content length
                             real_content_length = attention_mask.sum().item()
@@ -125,18 +131,23 @@ class HuggingFaceDataModule(BaseDataModule):
                         
                         batch["position_ids"] = position_ids
                     else:
-                        print("  [INACTIVE] Position resets disabled - using default continuous positions")
+                        if not hasattr(collate_packed_sequences, '_logged_no_pos_reset'):
+                            print("  [INACTIVE] Position resets disabled - using default continuous positions")
+                            collate_packed_sequences._logged_no_pos_reset = True
                         # Don't add position_ids to batch
                         # Model will generate default continuous positions [0, 1, 2, ...]
                     
                     # ===== FEATURE 2: BLOCK DIAGONAL ATTENTION =====
                     if USE_BLOCK_DIAGONAL:
-                        print("  [ACTIVE] Generating document-level block diagonal attention mask")
+                        if not hasattr(collate_packed_sequences, '_logged_block_diag'):
+                            print("  [ACTIVE] Generating document-level block diagonal attention mask")
+                            collate_packed_sequences._logged_block_diag = True
+                        
                         doc_attention_mask = torch.zeros((batch_size, seq_len, seq_len), dtype=torch.bool)
                         
                         for i in range(batch_size):
                             input_ids = batch["input_ids"][i]
-                            attention_mask = batch["attention_mask"][i]
+                            attention_mask = original_attention_mask[i]  # Use original 2D mask
                             
                             # Find real content length
                             real_content_length = attention_mask.sum().item()
@@ -158,30 +169,36 @@ class HuggingFaceDataModule(BaseDataModule):
                                 causal_block = torch.tril(torch.ones((doc_len, doc_len), dtype=torch.bool))
                                 doc_attention_mask[i, start_pos:end_pos, start_pos:end_pos] = causal_block
                         
-                        batch["attention_mask"] = doc_attention_mask  # 3D block diagonal mask
+                        batch["attention_mask"] = doc_attention_mask  # Overwrite with 3D block diagonal mask
                     else:
-                        print("  [INACTIVE] Block diagonal disabled - using simple 2D padding mask")
-                        # Keep the original 2D attention mask (already in batch)
-                        # batch["attention_mask"] is already set from line 22
+                        if not hasattr(collate_packed_sequences, '_logged_no_block_diag'):
+                            print("  [INACTIVE] Block diagonal disabled - using simple 2D padding mask")
+                            collate_packed_sequences._logged_no_block_diag = True
+                        # Keep the original 2D attention mask (already in batch from line 79)
                     
                     # ===== FEATURE 3: MASKED LOSS =====
                     if USE_MASKED_LOSS:
-                        print("  [ACTIVE] Masking loss for EOS tokens and padding")
+                        if not hasattr(collate_packed_sequences, '_logged_masked_loss'):
+                            print("  [ACTIVE] Masking loss for EOS tokens and padding")
+                            collate_packed_sequences._logged_masked_loss = True
+                        
                         labels = batch["input_ids"].clone()
                         
+                        # ===== FIX: Always use original 2D mask for label masking =====
                         # Mask REAL EOS tokens first (document boundaries where attention_mask == 1)
-                        real_eos_mask = (batch["input_ids"] == EOS_TOKEN_ID) & (batch["attention_mask"] == 1)
+                        real_eos_mask = (batch["input_ids"] == EOS_TOKEN_ID) & (original_attention_mask == 1)
                         labels[real_eos_mask] = IGNORE_INDEX
                         
-                        # Mask padding tokens (where attention_mask == 0)
-                        labels[batch["attention_mask"] == 0] = IGNORE_INDEX
+                        # Mask padding tokens (where original attention_mask == 0)
+                        labels[original_attention_mask == 0] = IGNORE_INDEX
                         
                         batch["labels"] = labels
                     else:
-                        print("  [INACTIVE] Loss masking disabled - using raw input_ids as labels")
+                        if not hasattr(collate_packed_sequences, '_logged_no_masked_loss'):
+                            print("  [INACTIVE] Loss masking disabled - using raw input_ids as labels")
+                            collate_packed_sequences._logged_no_masked_loss = True
                         # Use input_ids directly as labels (standard causal LM)
                         batch["labels"] = batch["input_ids"].clone()
-                    print('-'*30)
                     
                     return batch
                 
@@ -193,21 +210,21 @@ class HuggingFaceDataModule(BaseDataModule):
                 _logger.info(f" Tokenizer: {cfg.model.get('hf_model_name_or_path')}")
                 _logger.info(f" EOS token ID: {self.tokenizer.eos_token_id}")
                 _logger.info("")
-                _logger.info("  Active Features:")
+                _logger.info("  Feature Flags:")
                 if USE_POSITION_RESET:
                     _logger.info("    Position ID resets at document boundaries")
                 else:
-                    _logger.info("    Position ID resets (using continuous positions)")
+                    _logger.info("    Position ID resets DISABLED (using continuous positions)")
                 
                 if USE_BLOCK_DIAGONAL:
                     _logger.info("    Document-level block diagonal attention masking")
                 else:
-                    _logger.info("    Block diagonal attention (using simple padding mask)")
+                    _logger.info("    Block diagonal attention DISABLED (using simple padding mask)")
                 
                 if USE_MASKED_LOSS:
                     _logger.info("    Loss masking for EOS and padding tokens")
                 else:
-                    _logger.info("    Loss masking (using all tokens for loss)")
+                    _logger.info("    Loss masking DISABLED (using all tokens for loss)")
                 _logger.info("="*80)
             else:
                 collate_fn = default_data_collator
