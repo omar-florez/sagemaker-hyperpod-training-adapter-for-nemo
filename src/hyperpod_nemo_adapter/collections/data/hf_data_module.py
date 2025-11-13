@@ -78,7 +78,7 @@ class HuggingFaceDataModule(BaseDataModule):
                 # ===== FEATURE FLAGS =====
                 USE_POSITION_RESET = True       # Toggle position ID resets
                 USE_MASKED_LOSS = True          # Toggle loss masking for EOS/padding
-                USE_BLOCK_DIAGONAL = False      # Toggle document-level attention blocking
+                USE_BLOCK_DIAGONAL = True      # Toggle document-level attention blocking
                 
                 def collate_packed_sequences(examples):
                     """
