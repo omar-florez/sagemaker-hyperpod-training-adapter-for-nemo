@@ -25,6 +25,16 @@ from hyperpod_nemo_adapter.utils.log_utils import Logger
 
 _logger = Logger().get_logger()
 
+print("=" * 80)
+print(f"Flash Attention available: {torch.backends.cuda.flash_sdp_enabled()}")
+print(f"Transformers version: {transformers.__version__}")
+# Check if FA2 is installed
+try:
+    import flash_attn
+    print(f"Flash Attention 2 installed: {flash_attn.__version__}")
+except ImportError:
+    print("Flash Attention 2 not installed")
+print("=" * 80)
 
 def mm_collate_fn(examples):
     lis = list(examples[0].keys())
@@ -79,6 +89,40 @@ class HuggingFaceDataModule(BaseDataModule):
                 _logger.info(f"   DataCollatorWithFlattening initialized")
                 _logger.info(f"   Tokenizer: {tokenizer_path}")
                 _logger.info(f"   EOS token: {self.tokenizer.eos_token_id}")
+            if self.use_packing:                
+                from transformers import AutoTokenizer
+                
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    cfg.model.get("hf_model_name_or_path"),
+                    token=cfg.model.get("hf_access_token")
+                )
+                
+                # PyTorch CrossEntropyLoss convention
+                IGNORE_INDEX = -100  
+                EOS_TOKEN_ID = self.tokenizer.eos_token_id
+                
+                def collate_packed_sequences(examples):
+                    batch = {
+                        "input_ids": torch.tensor([ex["input_ids"] for ex in examples], dtype=torch.long),
+                        "attention_mask": torch.tensor([ex["attention_mask"] for ex in examples], dtype=torch.long),
+                    }
+                    labels = batch["input_ids"].clone()
+                    # Mask padding tokens (where attention_mask == 0)
+                    labels[batch["attention_mask"] == 0] = IGNORE_INDEX
+                    # Prevents the model from learning to predict tokens after a document ends enforcing  
+                    # document boundaries so the model doesn't hallucinate relationships between unrelated 
+                    # documents: P(tok | document_context)
+                    labels[labels == EOS_TOKEN_ID] = IGNORE_INDEX
+                    batch["labels"] = labels
+                    return batch
+                
+                collate_fn = collate_packed_sequences
+                
+                _logger.info("="*80)
+                _logger.info("  Sequence packing enabled")
+                _logger.info(f" Tokenizer: {fg.model.get("hf_model_name_or_path")}")
+                _logger.info(f" EOS token: {self.tokenizer.eos_token_id}")
+                _logger.info("="*80)                
             else:
                 collate_fn = default_data_collator
                 _logger.info("Using default data collator (no sequence packing)")
