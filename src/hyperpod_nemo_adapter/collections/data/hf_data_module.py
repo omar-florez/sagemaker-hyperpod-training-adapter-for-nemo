@@ -10,6 +10,7 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
+import os
 import torch
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer
@@ -37,41 +38,20 @@ def mm_collate_fn(examples):
 
 
 class HuggingFaceDataModule(BaseDataModule):
-    """
-    Lightning DataModule for HuggingFace Pretraining dataset pipelining
-    """
     def __init__(self, cfg: DictConfig, trainer: Trainer, collate_fn=None):
-        print("=" * 80)
-        print("DEBUG: Inside HuggingFaceDataModule.__init__")
-        print(f"Type of cfg: {type(cfg)}")
-        print(f"cfg keys: {cfg.keys() if hasattr(cfg, 'keys') else 'N/A'}")
+        # Try config first, then fall back to env var
+        use_packing_from_config = cfg.model.data.get("use_sequence_packing", None)
+        use_packing_from_env = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
         
-        # Try different paths
-        print(f"\nTrying cfg.model.data:")
-        try:
-            print(f"  cfg.model.data = {cfg.model.data}")
-            print(f"  use_sequence_packing = {cfg.model.data.get('use_sequence_packing', 'NOT FOUND')}")
-        except Exception as e:
-            print(f"  ERROR: {e}")
-        
-        print(f"\nTrying cfg.data:")
-        try:
-            print(f"  cfg.data = {cfg.data if hasattr(cfg, 'data') else 'NO DATA ATTR'}")
-            if hasattr(cfg, 'data'):
-                print(f"  use_sequence_packing = {cfg.data.get('use_sequence_packing', 'NOT FOUND')}")
-        except Exception as e:
-            print(f"  ERROR: {e}")
-        
-        print("=" * 80)
-        
-        
-        # Check if sequence packing is enabled
-        self.use_packing = cfg.model.data.get("use_sequence_packing", False)
+        self.use_packing = use_packing_from_config if use_packing_from_config is not None else use_packing_from_env
         self.tokenizer = None
         
         print("=" * 80)
         print("SEQUENCE PACKING LOADED - Omar's Custom Code")
         print(f"Training dir: {cfg.model.data.train_dir}")
+        print(f"use_packing (from config): {use_packing_from_config}")
+        print(f"use_packing (from env): {use_packing_from_env}")
+        print(f"use_packing (final): {self.use_packing}")
         print("=" * 80)
         
         if collate_fn is None:
@@ -82,7 +62,6 @@ class HuggingFaceDataModule(BaseDataModule):
                 
                 from transformers import DataCollatorWithFlattening, AutoTokenizer
                 
-                # Get tokenizer
                 tokenizer_path = cfg.model.get("hf_model_name_or_path", "meta-llama/Llama-3.1-70B")
                 access_token = cfg.model.get("hf_access_token", None)
                 
@@ -91,7 +70,6 @@ class HuggingFaceDataModule(BaseDataModule):
                     token=access_token
                 )
                 
-                # Use DataCollatorWithFlattening for packed sequences
                 collate_fn = DataCollatorWithFlattening(
                     tokenizer=self.tokenizer,
                     return_position_ids=True,
