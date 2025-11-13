@@ -60,7 +60,7 @@ class HuggingFaceDataModule(BaseDataModule):
         print("SEQUENCE PACKING")
         print(f"use_packing (config): {use_packing_from_config}")
         print(f"use_packing (env): {use_packing_from_env}")
-        print(f"use_packing: {use_packing}")
+        print(f"use_packing: {self.use_packing}")
         print("=" * 80)
         
         if collate_fn is None:
