@@ -11,6 +11,7 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 
+import inspect
 import math
 import os
 import time
@@ -408,6 +409,453 @@ class SageMakerNLPBaseModel(ModelPT):
             return AutoModelForCausalLM.from_config(model_cfg)
         return AutoModelForCausalLM.from_config(model_cfg, attn_implementation=attn)
 
+    # =========================================================================
+    # DEBUG METHODS FOR SEQUENCE PACKING
+    # =========================================================================
+
+    def _debug_log_batch_structure(self, batch_idx, input_ids, attention_mask, labels, position_ids, use_packing):
+        """
+        DEBUG STEP 1: Log complete batch structure to understand data flow.
+        """
+        print("=" * 100)
+        print(f"DEBUG STEP 1: BATCH STRUCTURE (batch_idx={batch_idx})")
+        print("=" * 100)
+
+        batch_size, seq_len = input_ids.shape
+        print(f"Batch size: {batch_size}, Sequence length: {seq_len}")
+        print(f"use_packing: {use_packing}")
+
+        # Get tokenizer info
+        try:
+            tokenizer = self.trainer.datamodule.tokenizer
+            print(f"tokenizer.eos_token_id: {tokenizer.eos_token_id}")
+            eos_token_id = tokenizer.eos_token_id if tokenizer else 128001  # Llama-3 default
+            print(f"EOS token ID: {eos_token_id}")
+        except Exception:
+            eos_token_id = 128001
+            print(f"EOS token ID (default): {eos_token_id}")
+
+        IGNORE_INDEX = -100
+
+        for sample_idx in range(min(batch_size, 2)):  # Log first 2 samples
+            print("-" * 80)
+            print(f"SAMPLE {sample_idx}:")
+            print("-" * 80)
+
+            ids = input_ids[sample_idx].cpu()
+            lab = labels[sample_idx].cpu()
+
+            # Find EOS positions
+            eos_positions = (ids == eos_token_id).nonzero(as_tuple=True)[0].tolist()
+            print(f"  EOS positions: {eos_positions[:20]}{'...' if len(eos_positions) > 20 else ''}")
+            print(f"  Number of documents: {len(eos_positions)}")
+
+            # Find padding (attention_mask == 0)
+            padding_start = seq_len
+            if attention_mask is not None:
+                if attention_mask.dim() == 2:
+                    mask = attention_mask[sample_idx].cpu()
+                    padding_positions = (mask == 0).nonzero(as_tuple=True)[0]
+                    if len(padding_positions) > 0:
+                        padding_start = padding_positions[0].item()
+                elif attention_mask.dim() == 3:
+                    # 3D mask - check diagonal for valid positions
+                    mask_diag = attention_mask[sample_idx].diagonal().cpu()
+                    padding_positions = (mask_diag == 0).nonzero(as_tuple=True)[0]
+                    if len(padding_positions) > 0:
+                        padding_start = padding_positions[0].item()
+
+            print(f"  Padding starts at position: {padding_start}")
+            print(f"  Real content length: {padding_start}")
+
+            # Find IGNORE_INDEX positions in labels
+            ignored_positions = (lab == IGNORE_INDEX).nonzero(as_tuple=True)[0].tolist()
+            print(f"  Labels with IGNORE_INDEX (-100): {len(ignored_positions)} positions")
+
+            # Show document boundaries with tokens (condensed format)
+            print(f"")
+            print(f"  Document structure:")
+            doc_start = 0
+            for doc_idx, eos_pos in enumerate(eos_positions[:5]):  # Show first 5 docs
+                doc_end = eos_pos + 1
+                doc_len = doc_end - doc_start
+
+                # Get tokens for this document
+                doc_input_ids = ids[doc_start:doc_end].tolist()
+                doc_labels = lab[doc_start:doc_end].tolist()
+
+                # Count ignored labels in this document
+                ignored_in_doc = sum(1 for l in doc_labels if l == IGNORE_INDEX)
+
+                print(f"    Doc {doc_idx}: positions [{doc_start}:{doc_end}] (len={doc_len}), ignored_labels={ignored_in_doc}")
+                
+                # Condensed format: first 5 ... last 5
+                if len(doc_input_ids) > 10:
+                    print(f"      input_ids:    [{', '.join(map(str, doc_input_ids[:5]))}, ..., {', '.join(map(str, doc_input_ids[-5:]))}]")
+                    print(f"      labels:       [{', '.join(map(str, doc_labels[:5]))}, ..., {', '.join(map(str, doc_labels[-5:]))}]")
+                else:
+                    print(f"      input_ids:    {doc_input_ids}")
+                    print(f"      labels:       {doc_labels}")
+
+                if position_ids is not None:
+                    pos = position_ids[sample_idx].cpu()
+                    doc_positions = pos[doc_start:doc_end].tolist()
+                    
+                    if len(doc_positions) > 10:
+                        print(f"      position_ids: [{', '.join(map(str, doc_positions[:5]))}, ..., {', '.join(map(str, doc_positions[-5:]))}]")
+                    else:
+                        print(f"      position_ids: {doc_positions}")
+
+                    # Verify position IDs start at 0
+                    if doc_positions[0] != 0:
+                        print(f"      [WARNING] Position IDs do not start at 0!")
+                    # Verify position IDs are sequential
+                    expected = list(range(doc_len))
+                    if doc_positions != expected:
+                        print(f"      [WARNING] Position IDs are not sequential [0, 1, 2, ...]!")
+
+                doc_start = doc_end
+
+            # Show content after last EOS (if any)
+            if eos_positions and eos_positions[-1] + 1 < padding_start:
+                remaining_start = eos_positions[-1] + 1
+                remaining_len = padding_start - remaining_start
+                print(f"    Remaining content after last EOS: positions [{remaining_start}:{padding_start}] (len={remaining_len})")
+
+            # Show alignment around EOS and MASKED positions (±1 context)
+            print(f"")
+            print(f"  Token alignment around EOS/MASKED positions (±1 context):")
+            print(f"  {'Pos':>5} | {'InputID':>8} | {'Label':>8} | {'PosID':>6} | Notes")
+            print(f"  {'-'*5}-+-{'-'*8}-+-{'-'*8}-+-{'-'*6}-+-{'-'*30}")
+
+            # Collect positions of interest: EOS positions and MASKED positions
+            positions_of_interest = set()
+            for eos_pos in eos_positions[:10]:  # First 10 EOS positions
+                positions_of_interest.add(max(0, eos_pos - 1))
+                positions_of_interest.add(eos_pos)
+                positions_of_interest.add(min(seq_len - 1, eos_pos + 1))
+            
+            # Also add first few MASKED positions that aren't near EOS
+            masked_positions = (lab == IGNORE_INDEX).nonzero(as_tuple=True)[0].tolist()
+            for masked_pos in masked_positions[:20]:
+                if masked_pos not in positions_of_interest:
+                    positions_of_interest.add(max(0, masked_pos - 1))
+                    positions_of_interest.add(masked_pos)
+                    positions_of_interest.add(min(seq_len - 1, masked_pos + 1))
+
+            # Sort and print
+            sorted_positions = sorted(positions_of_interest)
+            last_printed = -2
+            for pos in sorted_positions:
+                if pos >= seq_len:
+                    continue
+                    
+                # Add separator if there's a gap
+                if pos > last_printed + 1 and last_printed >= 0:
+                    print(f"  {'...':>5} |")
+                
+                input_id = ids[pos].item()
+                label = lab[pos].item()
+                pos_id = position_ids[sample_idx, pos].item() if position_ids is not None else pos
+
+                notes = []
+                if input_id == eos_token_id:
+                    notes.append("EOS")
+                if label == IGNORE_INDEX:
+                    notes.append("MASKED")
+                if position_ids is not None and pos > 0:
+                    prev_pos_id = position_ids[sample_idx, pos - 1].item()
+                    if pos_id < prev_pos_id:
+                        notes.append("POS_RESET")
+                if pos in eos_positions:
+                    notes.append("<-- DOC BOUNDARY")
+
+                notes_str = ", ".join(notes) if notes else ""
+                print(f"  {pos:>5} | {input_id:>8} | {label:>8} | {pos_id:>6} | {notes_str}")
+                last_printed = pos
+
+        # Log attention mask info
+        if attention_mask is not None:
+            print(f"")
+            print(f"  Attention mask:")
+            print(f"    Shape: {attention_mask.shape}")
+            print(f"    Dtype: {attention_mask.dtype}")
+
+            if attention_mask.dim() == 3:
+                # Visualize block structure for first sample around first EOS
+                mask = attention_mask[0].cpu()
+                if eos_positions:
+                    first_eos = eos_positions[0]
+                    start_row = max(0, first_eos - 5)
+                    end_row = min(seq_len, first_eos + 10)
+                    print(f"    Block diagonal structure around first EOS (pos {first_eos}):")
+                    header = "      " + "".join([f"{i % 10}" for i in range(start_row, end_row)])
+                    print(header)
+                    for row in range(start_row, end_row):
+                        line = f"  {row:>3} "
+                        for col in range(start_row, end_row):
+                            if mask[row, col]:
+                                line += "#"
+                            else:
+                                line += "."
+                        if row in eos_positions[:3]:
+                            line += " <-- EOS"
+                        print(line)
+                else:
+                    print(f"    Block diagonal structure (20x20):")
+                    header = "      " + "".join([f"{i % 10}" for i in range(20)])
+                    print(header)
+                    for row in range(min(20, seq_len)):
+                        line = f"  {row:>3} "
+                        for col in range(min(20, seq_len)):
+                            if mask[row, col]:
+                                line += "#"
+                            else:
+                                line += "."
+                        print(line)
+
+    def _debug_log_model_signature(self):
+        """
+        DEBUG STEP 2: Log model forward signature to verify what parameters are accepted.
+        """
+        print("=" * 100)
+        print("DEBUG STEP 2: MODEL FORWARD SIGNATURE")
+        print("=" * 100)
+
+        # Check the wrapped model
+        model = self.model
+        print(f"Model type: {type(model)}")
+
+        # Try to get the inner model
+        if hasattr(model, '_fsdp_wrapped_module'):
+            inner = model._fsdp_wrapped_module
+            print(f"Inner model type: {type(inner)}")
+
+            # Check forward signature
+            try:
+                sig = inspect.signature(inner.forward)
+                params = list(sig.parameters.keys())
+                print(f"Inner model forward parameters: {params}")
+
+                # Check if position_ids is accepted
+                if 'position_ids' in params:
+                    print("  [OK] Model accepts 'position_ids' parameter")
+                else:
+                    print("  [WARNING] Model does NOT accept 'position_ids' parameter!")
+
+                # Check if attention_mask is accepted
+                if 'attention_mask' in params:
+                    print("  [OK] Model accepts 'attention_mask' parameter")
+                else:
+                    print("  [WARNING] Model does NOT accept 'attention_mask' parameter!")
+            except Exception as e:
+                print(f"Could not inspect inner model signature: {e}")
+
+        # Check TransformerLayer signature
+        try:
+            for name, module in model.named_modules():
+                if 'TransformerLayer' in type(module).__name__:
+                    sig = inspect.signature(module.forward)
+                    params = list(sig.parameters.keys())
+                    print(f"")
+                    print(f"TransformerLayer ({name}) forward parameters: {params}")
+                    break
+        except Exception as e:
+            print(f"Could not inspect TransformerLayer signature: {e}")
+
+        # Check rotary embedding
+        try:
+            for name, module in model.named_modules():
+                if 'Rotary' in type(module).__name__ or 'rotary' in name:
+                    print(f"")
+                    print(f"Rotary embedding module: {name}")
+                    print(f"  Type: {type(module)}")
+                    print(f"  Module: {module}")
+
+                    try:
+                        sig = inspect.signature(module.forward)
+                        params = list(sig.parameters.keys())
+                        print(f"  Forward parameters: {params}")
+                    except Exception:
+                        print("  Could not get forward signature")
+                    break
+        except Exception as e:
+            print(f"Could not inspect rotary embedding: {e}")
+
+        # Check DotProductAttention signature
+        try:
+            for name, module in model.named_modules():
+                if 'DotProductAttention' in type(module).__name__:
+                    sig = inspect.signature(module.forward)
+                    params = list(sig.parameters.keys())
+                    print(f"")
+                    print(f"DotProductAttention forward parameters: {params}")
+                    break
+        except Exception as e:
+            print(f"Could not inspect DotProductAttention signature: {e}")
+
+    def _debug_test_forward_variants(self, input_ids, attention_mask, labels, position_ids):
+        """
+        DEBUG STEP 3: Test forward pass with different parameter combinations.
+        """
+        print("=" * 100)
+        print("DEBUG STEP 3: FORWARD PASS VARIANTS TEST")
+        print("=" * 100)
+
+        seq_len = input_ids.shape[1]
+
+        # Prepare default position_ids for comparison
+        default_position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand_as(input_ids)
+
+        # Prepare 2D attention mask (if we have 3D)
+        if attention_mask is not None and attention_mask.dim() == 3:
+            attention_mask_2d = attention_mask.diagonal(dim1=-2, dim2=-1).long()
+        elif attention_mask is not None:
+            attention_mask_2d = attention_mask
+        else:
+            attention_mask_2d = None
+
+        tests = [
+            {
+                "name": "A: No attention_mask, no position_ids (baseline)",
+                "attention_mask": None,
+                "position_ids": None,
+            },
+            {
+                "name": "B: 2D attention_mask only",
+                "attention_mask": attention_mask_2d,
+                "position_ids": None,
+            },
+            {
+                "name": "C: Custom position_ids only",
+                "attention_mask": None,
+                "position_ids": position_ids,
+            },
+            {
+                "name": "D: Default position_ids (continuous)",
+                "attention_mask": None,
+                "position_ids": default_position_ids,
+            },
+            {
+                "name": "E: 2D attention_mask + custom position_ids",
+                "attention_mask": attention_mask_2d,
+                "position_ids": position_ids,
+            },
+        ]
+
+        # Only test 3D mask if it exists and is small enough
+        if attention_mask is not None and attention_mask.dim() == 3:
+            tests.append({
+                "name": "F: 3D attention_mask + custom position_ids",
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            })
+
+        results = []
+
+        for test in tests:
+            test_name = test["name"]
+            try:
+                with torch.no_grad():
+                    forward_kwargs = {
+                        "input_ids": input_ids,
+                        "labels": labels,
+                    }
+                    if test["attention_mask"] is not None:
+                        forward_kwargs["attention_mask"] = test["attention_mask"]
+                    if test["position_ids"] is not None:
+                        forward_kwargs["position_ids"] = test["position_ids"]
+
+                    output = self.model(**forward_kwargs)
+                    loss = output["loss"].item() if isinstance(output, dict) else output.loss.item()
+
+                results.append((test_name, loss, "OK"))
+                print(f"  {test_name}: loss = {loss:.4f}")
+
+            except Exception as e:
+                results.append((test_name, None, str(e)[:100]))
+                print(f"  {test_name}: FAILED - {str(e)[:100]}")
+
+        # Analysis
+        print("")
+        print("  Analysis:")
+
+        # Compare C vs D (custom vs default position_ids)
+        loss_c = next((r[1] for r in results if "C:" in r[0] and r[1] is not None), None)
+        loss_d = next((r[1] for r in results if "D:" in r[0] and r[1] is not None), None)
+
+        if loss_c is not None and loss_d is not None:
+            diff = abs(loss_c - loss_d)
+            if diff < 0.001:
+                print(f"  [PROBLEM] Custom position_ids (C) vs default (D) have same loss!")
+                print(f"            This suggests position_ids are being IGNORED by the model.")
+            else:
+                print(f"  [OK] Custom position_ids affect loss (diff = {diff:.4f})")
+
+        # Compare A vs B (with/without attention mask)
+        loss_a = next((r[1] for r in results if "A:" in r[0] and r[1] is not None), None)
+        loss_b = next((r[1] for r in results if "B:" in r[0] and r[1] is not None), None)
+
+        if loss_a is not None and loss_b is not None:
+            diff = abs(loss_a - loss_b)
+            if diff < 0.001:
+                print(f"  [INFO] 2D attention_mask has minimal effect (diff = {diff:.4f})")
+            else:
+                print(f"  [INFO] 2D attention_mask affects loss (diff = {diff:.4f})")
+
+        # Check if 3D mask works
+        loss_f = next((r[1] for r in results if "F:" in r[0] and r[1] is not None), None)
+        if loss_f is not None and loss_c is not None:
+            diff = abs(loss_f - loss_c)
+            print(f"  [INFO] 3D mask vs no mask diff = {diff:.4f}")
+
+    def _debug_verify_rope_source(self):
+        """
+        DEBUG STEP 4: Check if RoPE implementation uses position_ids.
+        """
+        print("=" * 100)
+        print("DEBUG STEP 4: ROPE SOURCE CODE VERIFICATION")
+        print("=" * 100)
+
+        # Find rotary embedding module
+        rotary_module = None
+        rotary_name = None
+        for name, module in self.model.named_modules():
+            if 'rotary' in name.lower() or 'Rotary' in type(module).__name__:
+                rotary_module = module
+                rotary_name = name
+                break
+
+        if rotary_module is None:
+            print("  Could not find rotary embedding module")
+            return
+
+        print(f"  Found rotary module: {rotary_name}")
+        print(f"  Type: {type(rotary_module)}")
+
+        # Check source code if possible
+        try:
+            source = inspect.getsource(type(rotary_module).forward)
+
+            # Check if position_ids is used
+            if 'position_ids' in source or 'pos_ids' in source or 'seq_idx' in source:
+                print("  [OK] Rotary forward method references position_ids or similar")
+            else:
+                print("  [WARNING] Rotary forward method does NOT reference position_ids!")
+                print("  This means custom position_ids will have NO effect!")
+
+            # Log first 1000 chars of source
+            print(f"  Source preview (first 1000 chars):")
+            for line in source[:1000].split('\n'):
+                print(f"    {line}")
+
+        except Exception as e:
+            print(f"  Could not inspect rotary source: {e}")
+
+    # =========================================================================
+    # TRAINING STEP METHODS
+    # =========================================================================
+
     def _training_step_dpo(self, batch, batch_idx, *a, **kw):
         prompt_ids, prompt_mask, chosen_ids, chosen_mask, rejected_ids, rejected_mask = self._prepare_dpo_input_batch(
             batch, batch_idx
@@ -453,12 +901,43 @@ class SageMakerNLPBaseModel(ModelPT):
         fp8 = self._cfg.fp8
         fp8_recipe = self.fp8_recipe
         fp8_group = tsm.state.world_process_group
-        
+
         input_ids, attention_mask, labels, position_ids = self._prepare_input_batch(batch, batch_idx)
-        
+
         # Check if sequence packing is enabled
         use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
-        
+
+        # =========================================================================
+        # DEBUG: Log batch structure for first few batches
+        # =========================================================================
+        if batch_idx < 3 and dist.get_rank() == 0:
+            self._debug_log_batch_structure(
+                batch_idx=batch_idx,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                position_ids=position_ids,
+                use_packing=use_packing
+            )
+
+        # =========================================================================
+        # DEBUG: Log model signature on first batch
+        # =========================================================================
+        if batch_idx == 0 and dist.get_rank() == 0:
+            self._debug_log_model_signature()
+            self._debug_verify_rope_source()
+
+        # =========================================================================
+        # DEBUG: Test forward variants on first batch
+        # =========================================================================
+        if batch_idx == 0 and dist.get_rank() == 0:
+            self._debug_test_forward_variants(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                position_ids=position_ids
+            )
+
         with transformer_engine.pytorch.fp8_autocast(
             enabled=fp8,
             fp8_recipe=fp8_recipe,
@@ -468,7 +947,7 @@ class SageMakerNLPBaseModel(ModelPT):
                 "input_ids": input_ids,
                 "labels": labels,
             }
-            
+
             # Only add optional parameters if they exist
             if use_packing:
                 if attention_mask is not None:
@@ -478,23 +957,54 @@ class SageMakerNLPBaseModel(ModelPT):
             else:
                 # Standard mode: attention_mask=None (default causal)
                 forward_kwargs["attention_mask"] = None
-            
+
             return self(*a, **forward_kwargs, **kw)["loss"]
 
     def _training_step(self, batch, batch_idx, *a, **kw):
         if self._cfg.get("multi_modal", None):
             return self(*a, **batch, **kw)["loss"]
-        
+
         input_ids, attention_mask, labels, position_ids = self._prepare_input_batch(batch, batch_idx)
-        
+
         # Check if sequence packing is enabled
         use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
-        
+
+        # =========================================================================
+        # DEBUG: Log batch structure for first few batches
+        # =========================================================================
+        if batch_idx < 3 and dist.get_rank() == 0:
+            self._debug_log_batch_structure(
+                batch_idx=batch_idx,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                position_ids=position_ids,
+                use_packing=use_packing
+            )
+
+        # =========================================================================
+        # DEBUG: Log model signature on first batch
+        # =========================================================================
+        if batch_idx == 0 and dist.get_rank() == 0:
+            self._debug_log_model_signature()
+            self._debug_verify_rope_source()
+
+        # =========================================================================
+        # DEBUG: Test forward variants on first batch
+        # =========================================================================
+        if batch_idx == 0 and dist.get_rank() == 0:
+            self._debug_test_forward_variants(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                position_ids=position_ids
+            )
+
         forward_kwargs = {
             "input_ids": input_ids,
             "labels": labels,
         }
-        
+
         # Only add optional parameters if they exist
         if use_packing:
             if attention_mask is not None:
@@ -504,7 +1014,7 @@ class SageMakerNLPBaseModel(ModelPT):
         else:
             # Standard mode: attention_mask=None (default causal)
             forward_kwargs["attention_mask"] = None
-        
+
         return self(*a, **forward_kwargs, **kw)["loss"]
 
     def training_step(self, batch, batch_idx, *a, **kw):
@@ -544,15 +1054,15 @@ class SageMakerNLPBaseModel(ModelPT):
             val_loss = compute_dpo_loss(**dpo_params)
         else:
             input_ids, attention_mask, labels, position_ids = self._prepare_input_batch(batch, batch_idx)
-            
+
             # Check if sequence packing is enabled
             use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
-            
+
             forward_kwargs = {
                 "input_ids": input_ids,
                 "labels": labels,
             }
-            
+
             # Only add optional parameters if they exist
             if use_packing:
                 if attention_mask is not None:
@@ -562,9 +1072,9 @@ class SageMakerNLPBaseModel(ModelPT):
             else:
                 # Standard mode: attention_mask=None (default causal)
                 forward_kwargs["attention_mask"] = None
-            
+
             val_loss = self(**forward_kwargs)["loss"]
-        
+
         self.val_loss += val_loss.detach()
         return val_loss
 
@@ -602,9 +1112,9 @@ class SageMakerNLPBaseModel(ModelPT):
         """
         # Check if sequence packing is enabled
         use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
-        
+
         batch_data = self.trainer.datamodule.get_batch(batch)
-        
+
         if use_packing and len(batch_data) == 4:
             # Sequence packing mode: extract all 4 components
             input_ids, attention_mask, labels, position_ids = batch_data
@@ -617,9 +1127,9 @@ class SageMakerNLPBaseModel(ModelPT):
             input_ids, _, labels = batch_data
             attention_mask = None
             position_ids = None
-        
+
         self.batch_num_sequences = input_ids.shape[0]
-        
+
         if self._cfg.get("context_parallel_degree", 1) > 1:
             if use_packing and position_ids is not None:
                 # Pack all components for context parallel
@@ -634,7 +1144,7 @@ class SageMakerNLPBaseModel(ModelPT):
             else:
                 # Legacy: only input_ids and labels
                 input_ids, labels = get_batch_for_cp_rank((input_ids, labels))
-        
+
         if batch_idx == 0 and dist.get_rank() == 0:
             # checking only on batch 0 to reduce checks during runtime
             if (self._cfg.get("context_parallel_degree", 1) > 1) & (
@@ -645,16 +1155,16 @@ class SageMakerNLPBaseModel(ModelPT):
                     f"If context parallelism is enabled, input_ids sequence length should be "
                     f"(model.max_context_width / model.context_parallel_degree)."
                 )
-        
+
         return input_ids, attention_mask, labels, position_ids
-    
+
     def _compute_packed_sequence_loss(self, logits, labels):
         """
         Custom loss for packed sequences
         """
         shift_logits = logits[..., :-1, :].contiguous()  # Remove last token
-        shift_labels = labels[..., 1:].contiguous()      # Remove first token
-        
+        shift_labels = labels[..., 1:].contiguous()  # Remove first token
+
         # Get EOS token ID
         if hasattr(self.trainer.datamodule, 'tokenizer') and self.trainer.datamodule.tokenizer is not None:
             eos_token_id = self.trainer.datamodule.tokenizer.eos_token_id
@@ -662,7 +1172,7 @@ class SageMakerNLPBaseModel(ModelPT):
             # Default for Llama models
             eos_token_id = 2
         loss_mask = (shift_labels != eos_token_id).float()
-        
+
         loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
         loss = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)),  # Flatten
@@ -820,4 +1330,3 @@ class SageMakerNLPBaseModel(ModelPT):
     def setup_validation_data(self):
         """We're using Data Module for data pipelining"""
         return None
-

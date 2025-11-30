@@ -46,6 +46,8 @@ class HuggingFaceDataModule(BaseDataModule):
         self.use_packing = use_packing_from_config if use_packing_from_config is not None else use_packing_from_env
         self.tokenizer = None
         
+        print(f"self.use_packing: {self.use_packing}")
+        
         if collate_fn is None:
             if self.use_packing:
                 print("=" * 80)
