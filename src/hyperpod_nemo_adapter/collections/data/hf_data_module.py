@@ -61,7 +61,7 @@ class HuggingFaceDataModule(BaseDataModule):
                 print("=" * 80)
                 
                 print("=" * 80)
-                print("SEQUENCE PACKING CONFIGURATION")
+                print("SEQUENCE PACKING CONFIGURATION (cu_seqlens mode)")
                 print(f"use_packing (config): {use_packing_from_config}")
                 print(f"use_packing (env): {use_packing_from_env}")
                 print(f"use_packing (final): {self.use_packing}")
@@ -77,157 +77,107 @@ class HuggingFaceDataModule(BaseDataModule):
                 IGNORE_INDEX = -100  # PyTorch CrossEntropyLoss convention
                 EOS_TOKEN_ID = self.tokenizer.eos_token_id
                 
-                # ===== FEATURE FLAGS =====
-                USE_POSITION_RESET = True       # Toggle position ID resets
-                USE_MASKED_LOSS = True          # Toggle loss masking for EOS/padding
-                USE_BLOCK_DIAGONAL = True      # Toggle document-level attention blocking
-                
-                def collate_packed_sequences(examples):
+                def collate_packed_sequences_cu_seqlens(examples):
                     """
-                    Collator for pre-packed sequences with configurable features:
-                    - Position ID resets at document boundaries (USE_POSITION_RESET)
-                    - Loss masking for EOS and padding (USE_MASKED_LOSS)
-                    - Document-level attention blocking (USE_BLOCK_DIAGONAL)
-                    """
-                    # Store original 2D attention mask (needed for label masking)
-                    original_attention_mask = torch.tensor([ex["attention_mask"] for ex in examples], dtype=torch.long)
+                    Collator for pre-packed sequences using cu_seqlens format.
                     
+                    Computes:
+                    - cu_seqlens_q/kv: Cumulative sequence lengths for each sample
+                    - max_seqlen: Maximum document length in batch
+                    - labels: With EOS and padding masked
+                    
+                    Does NOT compute position_ids or block diagonal masks - 
+                    cu_seqlens handles attention blocking in TransformerEngine.
+                    """
+                    if not hasattr(collate_packed_sequences_cu_seqlens, '_logged'):
+                        print("  [ACTIVE] cu_seqlens mode: Computing cumulative sequence lengths")
+                        print(f"  [ACTIVE] EOS token ID: {EOS_TOKEN_ID}")
+                        print("  [ACTIVE] Masking EOS and padding in labels")
+                        collate_packed_sequences_cu_seqlens._logged = True
+                    
+                    # Stack into batch tensors
+                    input_ids = torch.tensor([ex["input_ids"] for ex in examples], dtype=torch.long)
+                    attention_mask = torch.tensor([ex["attention_mask"] for ex in examples], dtype=torch.long)
+                    
+                    batch_size, seq_len = input_ids.shape
+                    
+                    # ===== COMPUTE CU_SEQLENS FOR EACH SAMPLE =====
+                    # List of cu_seqlens tensors, one per sample in batch
+                    cu_seqlens_list = []
+                    max_seqlen_in_batch = 0
+                    
+                    for b in range(batch_size):
+                        # Find real content length (excluding padding)
+                        real_length = attention_mask[b].sum().item()
+                        sample_ids = input_ids[b, :real_length]
+                        
+                        # Find EOS positions (document boundaries)
+                        eos_mask = (sample_ids == EOS_TOKEN_ID)
+                        eos_positions = eos_mask.nonzero(as_tuple=True)[0]
+                        
+                        if len(eos_positions) > 0:
+                            # cu_seqlens: [0, end_of_doc1, end_of_doc2, ...]
+                            # Each document ends at EOS (inclusive), so positions are eos_pos + 1
+                            cu_seqlens = torch.zeros(len(eos_positions) + 1, dtype=torch.int32)
+                            cu_seqlens[1:] = eos_positions + 1
+                            
+                            # Check if there's content after the last EOS (incomplete doc)
+                            last_eos = eos_positions[-1].item()
+                            if last_eos + 1 < real_length:
+                                # Add the remaining content as final segment
+                                cu_seqlens = torch.cat([
+                                    cu_seqlens, 
+                                    torch.tensor([real_length], dtype=torch.int32)
+                                ])
+                        else:
+                            # No EOS found - treat entire sequence as one document
+                            cu_seqlens = torch.tensor([0, real_length], dtype=torch.int32)
+                        
+                        cu_seqlens_list.append(cu_seqlens)
+                        
+                        # Compute document lengths and track max
+                        doc_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+                        if len(doc_lengths) > 0:
+                            max_seqlen_in_batch = max(max_seqlen_in_batch, doc_lengths.max().item())
+                    
+                    # ===== CREATE LABELS WITH MASKING =====
+                    labels = input_ids.clone()
+                    
+                    # Mask EOS tokens (document boundaries) - don't predict EOS
+                    eos_mask = (input_ids == EOS_TOKEN_ID) & (attention_mask == 1)
+                    labels[eos_mask] = IGNORE_INDEX
+                    
+                    # Mask padding tokens
+                    labels[attention_mask == 0] = IGNORE_INDEX
+                    
+                    # ===== BUILD BATCH DICT =====
                     batch = {
-                        "input_ids": torch.tensor([ex["input_ids"] for ex in examples], dtype=torch.long),
-                        "attention_mask": original_attention_mask.clone(),  # Will be overwritten if block diagonal
+                        "input_ids": input_ids,
+                        "attention_mask": attention_mask,  # Keep 2D mask for compatibility
+                        "labels": labels,
+                        # cu_seqlens for each sample in batch
+                        "cu_seqlens_list": cu_seqlens_list,
+                        "max_seqlen": max_seqlen_in_batch,
+                        "batch_size": batch_size,
+                        "seq_len": seq_len,
                     }
-                    
-                    batch_size, seq_len = batch["input_ids"].shape
-                    
-                    # ===== FEATURE 1: POSITION ID RESETS =====
-                    if USE_POSITION_RESET:
-                        if not hasattr(collate_packed_sequences, '_logged_pos_reset'):
-                            print("  [ACTIVE] Generating position IDs with resets at EOS boundaries")
-                            collate_packed_sequences._logged_pos_reset = True
-                        
-                        position_ids = torch.zeros_like(batch["input_ids"])
-                        
-                        for i in range(batch_size):
-                            input_ids = batch["input_ids"][i]
-                            attention_mask = original_attention_mask[i]  # Use original 2D mask
-                            
-                            # Find real content length
-                            real_content_length = attention_mask.sum().item()
-                            real_input_ids = input_ids[:real_content_length]
-                            
-                            # Find EOS positions in real content
-                            eos_mask = (real_input_ids == EOS_TOKEN_ID)
-                            eos_positions = eos_mask.nonzero(as_tuple=True)[0].tolist()
-                            
-                            # Generate position IDs with resets at EOS boundaries
-                            last_eos = -1
-                            for eos_pos in eos_positions:
-                                length = eos_pos - last_eos
-                                position_ids[i, last_eos+1:eos_pos+1] = torch.arange(length)
-                                last_eos = eos_pos
-                            
-                            # Fill remaining real content after last EOS
-                            if last_eos < real_content_length - 1:
-                                length = real_content_length - last_eos - 1
-                                position_ids[i, last_eos+1:real_content_length] = torch.arange(length)
-                        
-                        batch["position_ids"] = position_ids
-                    else:
-                        if not hasattr(collate_packed_sequences, '_logged_no_pos_reset'):
-                            print("  [INACTIVE] Position resets disabled - using default continuous positions")
-                            collate_packed_sequences._logged_no_pos_reset = True
-                        # Don't add position_ids to batch
-                        # Model will generate default continuous positions [0, 1, 2, ...]
-                    
-                    # ===== FEATURE 2: BLOCK DIAGONAL ATTENTION =====
-                    if USE_BLOCK_DIAGONAL:
-                        if not hasattr(collate_packed_sequences, '_logged_block_diag'):
-                            print("  [ACTIVE] Generating document-level block diagonal attention mask")
-                            collate_packed_sequences._logged_block_diag = True
-                        
-                        doc_attention_mask = torch.zeros((batch_size, seq_len, seq_len), dtype=torch.bool)
-                        
-                        for i in range(batch_size):
-                            input_ids = batch["input_ids"][i]
-                            attention_mask = original_attention_mask[i]  # Use original 2D mask
-                            
-                            # Find real content length
-                            real_content_length = attention_mask.sum().item()
-                            real_input_ids = input_ids[:real_content_length]
-                            
-                            # Find EOS positions in real content
-                            eos_mask = (real_input_ids == EOS_TOKEN_ID)
-                            eos_positions = eos_mask.nonzero(as_tuple=True)[0].tolist()
-                            
-                            # Create document-level attention blocks
-                            doc_boundaries = [-1] + eos_positions + [real_content_length - 1]
-                            
-                            for doc_start, doc_end in zip(doc_boundaries[:-1], doc_boundaries[1:]):
-                                start_pos = doc_start + 1
-                                end_pos = doc_end + 1
-                                
-                                # Create causal mask within this document block
-                                doc_len = end_pos - start_pos
-                                causal_block = torch.tril(torch.ones((doc_len, doc_len), dtype=torch.bool))
-                                doc_attention_mask[i, start_pos:end_pos, start_pos:end_pos] = causal_block
-                        
-                        batch["attention_mask"] = doc_attention_mask  # Overwrite with 3D block diagonal mask
-                    else:
-                        if not hasattr(collate_packed_sequences, '_logged_no_block_diag'):
-                            print("  [INACTIVE] Block diagonal disabled - using simple 2D padding mask")
-                            collate_packed_sequences._logged_no_block_diag = True
-                        # Keep the original 2D attention mask (already in batch from line 79)
-                    
-                    # ===== FEATURE 3: MASKED LOSS =====
-                    if USE_MASKED_LOSS:
-                        if not hasattr(collate_packed_sequences, '_logged_masked_loss'):
-                            print("  [ACTIVE] Masking loss for EOS tokens and padding")
-                            collate_packed_sequences._logged_masked_loss = True
-                        
-                        labels = batch["input_ids"].clone()
-                        
-                        # ===== FIX: Always use original 2D mask for label masking =====
-                        # Mask REAL EOS tokens first (document boundaries where attention_mask == 1)
-                        real_eos_mask = (batch["input_ids"] == EOS_TOKEN_ID) & (original_attention_mask == 1)
-                        labels[real_eos_mask] = IGNORE_INDEX
-                        
-                        # Mask padding tokens (where original attention_mask == 0)
-                        labels[original_attention_mask == 0] = IGNORE_INDEX
-                        
-                        batch["labels"] = labels
-                    else:
-                        if not hasattr(collate_packed_sequences, '_logged_no_masked_loss'):
-                            print("  [INACTIVE] Loss masking disabled - using raw input_ids as labels")
-                            collate_packed_sequences._logged_no_masked_loss = True
-                        # Use input_ids directly as labels (standard causal LM)
-                        batch["labels"] = batch["input_ids"].clone()
                     
                     return batch
                 
-                collate_fn = collate_packed_sequences
+                collate_fn = collate_packed_sequences_cu_seqlens
                 
                 # ===== LOGGING CONFIGURATION =====
-                _logger.info("="*80)
-                _logger.info("SEQUENCE PACKING ENABLED")
-                _logger.info(f" Tokenizer: {cfg.model.get('hf_model_name_or_path')}")
-                _logger.info(f" EOS token ID: {self.tokenizer.eos_token_id}")
+                _logger.info("=" * 80)
+                _logger.info("SEQUENCE PACKING ENABLED (cu_seqlens mode)")
+                _logger.info(f"  Tokenizer: {cfg.model.get('hf_model_name_or_path')}")
+                _logger.info(f"  EOS token ID: {self.tokenizer.eos_token_id}")
                 _logger.info("")
-                _logger.info("  Feature Flags:")
-                if USE_POSITION_RESET:
-                    _logger.info("    Position ID resets at document boundaries")
-                else:
-                    _logger.info("    Position ID resets DISABLED (using continuous positions)")
-                
-                if USE_BLOCK_DIAGONAL:
-                    _logger.info("    Document-level block diagonal attention masking")
-                else:
-                    _logger.info("    Block diagonal attention DISABLED (using simple padding mask)")
-                
-                if USE_MASKED_LOSS:
-                    _logger.info("    Loss masking for EOS and padding tokens")
-                else:
-                    _logger.info("    Loss masking DISABLED (using all tokens for loss)")
-                _logger.info("="*80)
+                _logger.info("  Features:")
+                _logger.info("    - cu_seqlens computed from EOS positions")
+                _logger.info("    - DotProductAttention hooks inject cu_seqlens")
+                _logger.info("    - Labels masked for EOS and padding")
+                _logger.info("    - Position IDs: default continuous (RoPE not patched)")
+                _logger.info("=" * 80)
             else:
                 collate_fn = default_data_collator
                 _logger.info("Using default data collator (no sequence packing)")
@@ -249,14 +199,22 @@ class HuggingFaceDataModule(BaseDataModule):
         return self._build_dataloader(self._validation_ds, batch_size=self.cfg.model.val_batch_size)
 
     def get_batch(self, data):
-        """Extract batch data including position_ids"""
-        if "position_ids" in data:
+        """
+        Extract batch data including cu_seqlens for sequence packing.
+        
+        Returns:
+            For packing mode: (input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen)
+            For standard mode: (input_ids, attention_mask, labels)
+        """
+        if "cu_seqlens_list" in data:
             return (
-                data["input_ids"], 
-                data["attention_mask"], 
+                data["input_ids"],
+                data["attention_mask"],
                 data["labels"],
-                data["position_ids"]
+                data["cu_seqlens_list"],
+                data["max_seqlen"],
             )
+        # Standard mode (no packing)
         return data["input_ids"], data["attention_mask"], data["labels"]
 
     def get_val_batch(self, data):

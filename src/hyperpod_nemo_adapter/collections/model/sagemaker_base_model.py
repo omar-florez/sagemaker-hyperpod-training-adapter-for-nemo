@@ -63,6 +63,8 @@ class SageMakerNLPBaseModel(ModelPT):
     General Lightning Model class for SageMaker adapter, it deals with general model/optimizer setup
     and training/eval behaviors.
     User will need to either consume the provided inheritors or inherit and implement their own model class.
+    
+    Supports sequence packing via cu_seqlens injection into TransformerEngine DotProductAttention.
     """
 
     # Whether if the model is predefined
@@ -80,6 +82,27 @@ class SageMakerNLPBaseModel(ModelPT):
         self.val_loss = 0
 
         self._config_mapping_hf_to_recipe_aliases = None
+
+        # =========================================================================
+        # SEQUENCE PACKING STATE (cu_seqlens approach)
+        # =========================================================================
+        self._cu_seqlens_q = None
+        self._cu_seqlens_kv = None
+        self._max_seqlen_q = None
+        self._max_seqlen_kv = None
+        self._packing_hooks = []
+        
+        # Check if sequence packing is enabled via config or environment
+        use_packing_from_config = cfg.model.data.get("use_sequence_packing", None) if hasattr(cfg, 'model') and hasattr(cfg.model, 'data') else None
+        use_packing_from_env = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
+        self._use_packing = use_packing_from_config if use_packing_from_config is not None else use_packing_from_env
+        
+        if self._use_packing and dist.get_rank() == 0:
+            _logger.info("=" * 80)
+            _logger.info("SEQUENCE PACKING MODE ENABLED (cu_seqlens approach)")
+            _logger.info("  cu_seqlens will be injected into DotProductAttention via hooks")
+            _logger.info("=" * 80)
+        # =========================================================================
 
         self.set_config_mapping_hf_to_recipe_aliases()
         # Setup Transformer Engine Variable
@@ -169,6 +192,156 @@ class SageMakerNLPBaseModel(ModelPT):
             and self._cfg.get("multi_modal", False)
         )
 
+    # =========================================================================
+    # SEQUENCE PACKING: cu_seqlens HOOK METHODS
+    # =========================================================================
+
+    def _register_packing_hooks(self):
+        """
+        Register forward pre-hooks on all DotProductAttention modules
+        to inject cu_seqlens for sequence packing.
+        
+        This enables TransformerEngine to properly isolate attention
+        between packed documents without cross-document attention.
+        """
+        if not self._use_packing:
+            return
+        
+        try:
+            from transformer_engine.pytorch.attention import DotProductAttention
+        except ImportError:
+            _logger.warning("TransformerEngine not available, cannot register packing hooks")
+            return
+        
+        hook_count = 0
+        for name, module in self.model.named_modules():
+            if isinstance(module, DotProductAttention):
+                hook = module.register_forward_pre_hook(
+                    self._dpa_pre_hook,
+                    with_kwargs=True
+                )
+                self._packing_hooks.append(hook)
+                hook_count += 1
+        
+        if dist.get_rank() == 0:
+            _logger.info(f"Registered {hook_count} DotProductAttention hooks for cu_seqlens injection")
+            if hook_count > 0:
+                _logger.info("  Hook will inject: cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv")
+
+    def _dpa_pre_hook(self, module, args, kwargs):
+        """
+        Forward pre-hook for DotProductAttention.
+        
+        Injects cu_seqlens parameters when sequence packing is active.
+        This enables TransformerEngine to properly isolate attention
+        between packed documents.
+        
+        Args:
+            module: The DotProductAttention module
+            args: Positional arguments to forward
+            kwargs: Keyword arguments to forward
+            
+        Returns:
+            Modified (args, kwargs) with cu_seqlens injected
+        """
+        if self._cu_seqlens_q is None:
+            # No packing data for this batch, pass through unchanged
+            return args, kwargs
+        
+        # Make a mutable copy of kwargs
+        kwargs = dict(kwargs)
+        
+        # Inject cu_seqlens into kwargs
+        kwargs['cu_seqlens_q'] = self._cu_seqlens_q
+        kwargs['cu_seqlens_kv'] = self._cu_seqlens_kv
+        kwargs['max_seqlen_q'] = self._max_seqlen_q
+        kwargs['max_seqlen_kv'] = self._max_seqlen_kv
+        
+        return args, kwargs
+
+    def _prepare_cu_seqlens_for_batch(self, cu_seqlens_list, max_seqlen, device):
+        """
+        Prepare cu_seqlens tensors for the current batch.
+        
+        For batch_size > 1, we concatenate each sample's cu_seqlens with
+        appropriate offsets so TransformerEngine treats the flattened batch
+        as a single sequence with multiple document boundaries.
+        
+        Args:
+            cu_seqlens_list: List of cu_seqlens tensors, one per sample in batch
+            max_seqlen: Maximum document length in batch
+            device: Target device for tensors
+        """
+        if cu_seqlens_list is None:
+            self._cu_seqlens_q = None
+            self._cu_seqlens_kv = None
+            self._max_seqlen_q = None
+            self._max_seqlen_kv = None
+            return
+        
+        batch_size = len(cu_seqlens_list)
+        
+        if batch_size == 1:
+            # Simple case: single sample, use cu_seqlens directly
+            cu_seqlens = cu_seqlens_list[0].to(device=device, dtype=torch.int32)
+            self._cu_seqlens_q = cu_seqlens
+            self._cu_seqlens_kv = cu_seqlens
+            self._max_seqlen_q = max_seqlen
+            self._max_seqlen_kv = max_seqlen
+        else:
+            # Multi-sample batch: Concatenate cu_seqlens with offsets
+            # Each sample's cu_seqlens needs to be offset by the cumulative length
+            # of previous samples
+            
+            # Get the padded sequence length from the first sample's final position
+            # All samples should have the same padded length
+            seq_len = cu_seqlens_list[0][-1].item()
+            
+            all_cu_seqlens = [torch.tensor([0], dtype=torch.int32, device=device)]
+            offset = 0
+            
+            for b, sample_cu_seqlens in enumerate(cu_seqlens_list):
+                # Move to device and add offset
+                sample_cu_seqlens = sample_cu_seqlens.to(device=device, dtype=torch.int32)
+                
+                # Add this sample's boundaries (excluding initial 0) with offset
+                boundaries = sample_cu_seqlens[1:] + offset
+                all_cu_seqlens.append(boundaries)
+                
+                # Each sample contributes seq_len tokens to the flattened batch
+                offset += seq_len
+            
+            cu_seqlens = torch.cat(all_cu_seqlens)
+            
+            self._cu_seqlens_q = cu_seqlens
+            self._cu_seqlens_kv = cu_seqlens
+            self._max_seqlen_q = max_seqlen
+            self._max_seqlen_kv = max_seqlen
+        
+        # Debug logging (first few batches only)
+        if not hasattr(self, '_cu_seqlens_log_count'):
+            self._cu_seqlens_log_count = 0
+        
+        if self._cu_seqlens_log_count < 3 and dist.get_rank() == 0:
+            _logger.info(f"[Batch {self._cu_seqlens_log_count}] cu_seqlens prepared:")
+            _logger.info(f"  Shape: {self._cu_seqlens_q.shape}")
+            _logger.info(f"  First 10 values: {self._cu_seqlens_q[:10].tolist()}")
+            _logger.info(f"  Last 5 values: {self._cu_seqlens_q[-5:].tolist()}")
+            _logger.info(f"  max_seqlen: {self._max_seqlen_q}")
+            _logger.info(f"  num_documents: {len(self._cu_seqlens_q) - 1}")
+            self._cu_seqlens_log_count += 1
+
+    def _clear_cu_seqlens(self):
+        """Clear cu_seqlens state after forward pass."""
+        self._cu_seqlens_q = None
+        self._cu_seqlens_kv = None
+        self._max_seqlen_q = None
+        self._max_seqlen_kv = None
+
+    # =========================================================================
+    # END SEQUENCE PACKING METHODS
+    # =========================================================================
+
     def setup(self, *a, **kw):
         if self.do_patch_mllama:
             patch_mllama_dtype.apply_patch(dtype=torch.bfloat16 if self._cfg.precision == "bf16" else torch.float32)
@@ -223,6 +396,13 @@ class SageMakerNLPBaseModel(ModelPT):
             self.ref_model.eval()
 
         self.fp8_recipe = self._fp8_delayed_scaling()
+        
+        # =========================================================================
+        # SEQUENCE PACKING: Register hooks after model is ready
+        # =========================================================================
+        if self._use_packing:
+            self._register_packing_hooks()
+        # =========================================================================
 
     def param_init_fn(self, module):
         _logger.warning(
@@ -413,29 +593,38 @@ class SageMakerNLPBaseModel(ModelPT):
     # DEBUG METHODS FOR SEQUENCE PACKING
     # =========================================================================
 
-    def _debug_log_batch_structure(self, batch_idx, input_ids, attention_mask, labels, position_ids, use_packing):
+    def _debug_log_batch_structure(self, batch_idx, input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen):
         """
-        DEBUG STEP 1: Log complete batch structure to understand data flow.
+        DEBUG: Log complete batch structure to understand data flow for cu_seqlens mode.
         """
         print("=" * 100)
-        print(f"DEBUG STEP 1: BATCH STRUCTURE (batch_idx={batch_idx})")
+        print(f"DEBUG: BATCH STRUCTURE (batch_idx={batch_idx}) - cu_seqlens mode")
         print("=" * 100)
 
         batch_size, seq_len = input_ids.shape
         print(f"Batch size: {batch_size}, Sequence length: {seq_len}")
-        print(f"use_packing: {use_packing}")
+        print(f"use_packing: {self._use_packing}")
 
         # Get tokenizer info
         try:
             tokenizer = self.trainer.datamodule.tokenizer
-            print(f"tokenizer.eos_token_id: {tokenizer.eos_token_id}")
-            eos_token_id = tokenizer.eos_token_id if tokenizer else 128001  # Llama-3 default
+            eos_token_id = tokenizer.eos_token_id if tokenizer else 128001
             print(f"EOS token ID: {eos_token_id}")
         except Exception:
             eos_token_id = 128001
             print(f"EOS token ID (default): {eos_token_id}")
 
         IGNORE_INDEX = -100
+
+        # Log cu_seqlens info
+        if cu_seqlens_list is not None:
+            print(f"\ncu_seqlens_list: {len(cu_seqlens_list)} samples")
+            for i, cu_seqlens in enumerate(cu_seqlens_list[:2]):  # First 2 samples
+                print(f"  Sample {i}: {cu_seqlens.shape}, values[:10]={cu_seqlens[:10].tolist()}")
+                print(f"           num_docs={len(cu_seqlens)-1}, last_value={cu_seqlens[-1].item()}")
+            print(f"max_seqlen: {max_seqlen}")
+        else:
+            print("\ncu_seqlens_list: None (standard mode)")
 
         for sample_idx in range(min(batch_size, 2)):  # Log first 2 samples
             print("-" * 80)
@@ -448,22 +637,15 @@ class SageMakerNLPBaseModel(ModelPT):
             # Find EOS positions
             eos_positions = (ids == eos_token_id).nonzero(as_tuple=True)[0].tolist()
             print(f"  EOS positions: {eos_positions[:20]}{'...' if len(eos_positions) > 20 else ''}")
-            print(f"  Number of documents: {len(eos_positions)}")
+            print(f"  Number of EOS tokens: {len(eos_positions)}")
 
             # Find padding (attention_mask == 0)
             padding_start = seq_len
-            if attention_mask is not None:
-                if attention_mask.dim() == 2:
-                    mask = attention_mask[sample_idx].cpu()
-                    padding_positions = (mask == 0).nonzero(as_tuple=True)[0]
-                    if len(padding_positions) > 0:
-                        padding_start = padding_positions[0].item()
-                elif attention_mask.dim() == 3:
-                    # 3D mask - check diagonal for valid positions
-                    mask_diag = attention_mask[sample_idx].diagonal().cpu()
-                    padding_positions = (mask_diag == 0).nonzero(as_tuple=True)[0]
-                    if len(padding_positions) > 0:
-                        padding_start = padding_positions[0].item()
+            if attention_mask is not None and attention_mask.dim() == 2:
+                mask = attention_mask[sample_idx].cpu()
+                padding_positions = (mask == 0).nonzero(as_tuple=True)[0]
+                if len(padding_positions) > 0:
+                    padding_start = padding_positions[0].item()
 
             print(f"  Padding starts at position: {padding_start}")
             print(f"  Real content length: {padding_start}")
@@ -472,385 +654,133 @@ class SageMakerNLPBaseModel(ModelPT):
             ignored_positions = (lab == IGNORE_INDEX).nonzero(as_tuple=True)[0].tolist()
             print(f"  Labels with IGNORE_INDEX (-100): {len(ignored_positions)} positions")
 
-            # Show document boundaries with tokens (condensed format)
-            print(f"")
-            print(f"  Document structure:")
-            doc_start = 0
-            for doc_idx, eos_pos in enumerate(eos_positions[:5]):  # Show first 5 docs
-                doc_end = eos_pos + 1
-                doc_len = doc_end - doc_start
-
-                # Get tokens for this document
-                doc_input_ids = ids[doc_start:doc_end].tolist()
-                doc_labels = lab[doc_start:doc_end].tolist()
-
-                # Count ignored labels in this document
-                ignored_in_doc = sum(1 for l in doc_labels if l == IGNORE_INDEX)
-
-                print(f"    Doc {doc_idx}: positions [{doc_start}:{doc_end}] (len={doc_len}), ignored_labels={ignored_in_doc}")
+            # Verify cu_seqlens matches EOS positions
+            if cu_seqlens_list is not None and sample_idx < len(cu_seqlens_list):
+                cu_seqlens = cu_seqlens_list[sample_idx]
+                # cu_seqlens should be [0, eos1+1, eos2+1, ...] 
+                expected_boundaries = [0] + [pos + 1 for pos in eos_positions if pos + 1 <= padding_start]
                 
-                # Condensed format: first 5 ... last 5
-                if len(doc_input_ids) > 10:
-                    print(f"      input_ids:    [{', '.join(map(str, doc_input_ids[:5]))}, ..., {', '.join(map(str, doc_input_ids[-5:]))}]")
-                    print(f"      labels:       [{', '.join(map(str, doc_labels[:5]))}, ..., {', '.join(map(str, doc_labels[-5:]))}]")
+                # Check if there's trailing content after last EOS
+                if eos_positions and eos_positions[-1] + 1 < padding_start:
+                    expected_boundaries.append(padding_start)
+                
+                actual_boundaries = cu_seqlens.tolist()
+                
+                print(f"\n  cu_seqlens verification:")
+                print(f"    Expected (from EOS): {expected_boundaries[:10]}{'...' if len(expected_boundaries) > 10 else ''}")
+                print(f"    Actual cu_seqlens:   {actual_boundaries[:10]}{'...' if len(actual_boundaries) > 10 else ''}")
+                
+                if expected_boundaries[:10] == actual_boundaries[:10]:
+                    print(f"    [OK] cu_seqlens matches EOS positions")
                 else:
-                    print(f"      input_ids:    {doc_input_ids}")
-                    print(f"      labels:       {doc_labels}")
+                    print(f"    [WARNING] cu_seqlens does NOT match EOS positions!")
 
-                if position_ids is not None:
-                    pos = position_ids[sample_idx].cpu()
-                    doc_positions = pos[doc_start:doc_end].tolist()
+            # Show document structure
+            print(f"\n  Document structure (first 5 docs):")
+            if cu_seqlens_list is not None and sample_idx < len(cu_seqlens_list):
+                cu_seqlens = cu_seqlens_list[sample_idx]
+                for doc_idx in range(min(5, len(cu_seqlens) - 1)):
+                    doc_start = cu_seqlens[doc_idx].item()
+                    doc_end = cu_seqlens[doc_idx + 1].item()
+                    doc_len = doc_end - doc_start
                     
-                    if len(doc_positions) > 10:
-                        print(f"      position_ids: [{', '.join(map(str, doc_positions[:5]))}, ..., {', '.join(map(str, doc_positions[-5:]))}]")
-                    else:
-                        print(f"      position_ids: {doc_positions}")
+                    # Count ignored labels in this document
+                    doc_labels = lab[doc_start:doc_end].tolist()
+                    ignored_in_doc = sum(1 for l in doc_labels if l == IGNORE_INDEX)
+                    
+                    print(f"    Doc {doc_idx}: positions [{doc_start}:{doc_end}] (len={doc_len}), ignored_labels={ignored_in_doc}")
 
-                    # Verify position IDs start at 0
-                    if doc_positions[0] != 0:
-                        print(f"      [WARNING] Position IDs do not start at 0!")
-                    # Verify position IDs are sequential
-                    expected = list(range(doc_len))
-                    if doc_positions != expected:
-                        print(f"      [WARNING] Position IDs are not sequential [0, 1, 2, ...]!")
+            # Show token alignment around first few EOS positions
+            print(f"\n  Token alignment around EOS positions:")
+            print(f"  {'Pos':>5} | {'InputID':>8} | {'Label':>8} | Notes")
+            print(f"  {'-'*5}-+-{'-'*8}-+-{'-'*8}-+-{'-'*30}")
 
-                doc_start = doc_end
+            positions_to_show = set()
+            for eos_pos in eos_positions[:5]:
+                positions_to_show.add(max(0, eos_pos - 1))
+                positions_to_show.add(eos_pos)
+                positions_to_show.add(min(seq_len - 1, eos_pos + 1))
 
-            # Show content after last EOS (if any)
-            if eos_positions and eos_positions[-1] + 1 < padding_start:
-                remaining_start = eos_positions[-1] + 1
-                remaining_len = padding_start - remaining_start
-                print(f"    Remaining content after last EOS: positions [{remaining_start}:{padding_start}] (len={remaining_len})")
-
-            # Show alignment around EOS and MASKED positions (±1 context)
-            print(f"")
-            print(f"  Token alignment around EOS/MASKED positions (±1 context):")
-            print(f"  {'Pos':>5} | {'InputID':>8} | {'Label':>8} | {'PosID':>6} | Notes")
-            print(f"  {'-'*5}-+-{'-'*8}-+-{'-'*8}-+-{'-'*6}-+-{'-'*30}")
-
-            # Collect positions of interest: EOS positions and MASKED positions
-            positions_of_interest = set()
-            for eos_pos in eos_positions[:10]:  # First 10 EOS positions
-                positions_of_interest.add(max(0, eos_pos - 1))
-                positions_of_interest.add(eos_pos)
-                positions_of_interest.add(min(seq_len - 1, eos_pos + 1))
-            
-            # Also add first few MASKED positions that aren't near EOS
-            masked_positions = (lab == IGNORE_INDEX).nonzero(as_tuple=True)[0].tolist()
-            for masked_pos in masked_positions[:20]:
-                if masked_pos not in positions_of_interest:
-                    positions_of_interest.add(max(0, masked_pos - 1))
-                    positions_of_interest.add(masked_pos)
-                    positions_of_interest.add(min(seq_len - 1, masked_pos + 1))
-
-            # Sort and print
-            sorted_positions = sorted(positions_of_interest)
             last_printed = -2
-            for pos in sorted_positions:
+            for pos in sorted(positions_to_show):
                 if pos >= seq_len:
                     continue
-                    
-                # Add separator if there's a gap
                 if pos > last_printed + 1 and last_printed >= 0:
                     print(f"  {'...':>5} |")
-                
+
                 input_id = ids[pos].item()
                 label = lab[pos].item()
-                pos_id = position_ids[sample_idx, pos].item() if position_ids is not None else pos
 
                 notes = []
                 if input_id == eos_token_id:
                     notes.append("EOS")
                 if label == IGNORE_INDEX:
                     notes.append("MASKED")
-                if position_ids is not None and pos > 0:
-                    prev_pos_id = position_ids[sample_idx, pos - 1].item()
-                    if pos_id < prev_pos_id:
-                        notes.append("POS_RESET")
                 if pos in eos_positions:
                     notes.append("<-- DOC BOUNDARY")
 
                 notes_str = ", ".join(notes) if notes else ""
-                print(f"  {pos:>5} | {input_id:>8} | {label:>8} | {pos_id:>6} | {notes_str}")
+                print(f"  {pos:>5} | {input_id:>8} | {label:>8} | {notes_str}")
                 last_printed = pos
-
-        # Log attention mask info
-        if attention_mask is not None:
-            print(f"")
-            print(f"  Attention mask:")
-            print(f"    Shape: {attention_mask.shape}")
-            print(f"    Dtype: {attention_mask.dtype}")
-
-            if attention_mask.dim() == 3:
-                # Visualize block structure for first sample around first EOS
-                mask = attention_mask[0].cpu()
-                if eos_positions:
-                    first_eos = eos_positions[0]
-                    start_row = max(0, first_eos - 5)
-                    end_row = min(seq_len, first_eos + 10)
-                    print(f"    Block diagonal structure around first EOS (pos {first_eos}):")
-                    header = "      " + "".join([f"{i % 10}" for i in range(start_row, end_row)])
-                    print(header)
-                    for row in range(start_row, end_row):
-                        line = f"  {row:>3} "
-                        for col in range(start_row, end_row):
-                            if mask[row, col]:
-                                line += "#"
-                            else:
-                                line += "."
-                        if row in eos_positions[:3]:
-                            line += " <-- EOS"
-                        print(line)
-                else:
-                    print(f"    Block diagonal structure (20x20):")
-                    header = "      " + "".join([f"{i % 10}" for i in range(20)])
-                    print(header)
-                    for row in range(min(20, seq_len)):
-                        line = f"  {row:>3} "
-                        for col in range(min(20, seq_len)):
-                            if mask[row, col]:
-                                line += "#"
-                            else:
-                                line += "."
-                        print(line)
 
     def _debug_log_model_signature(self):
         """
-        DEBUG STEP 2: Log model forward signature to verify what parameters are accepted.
+        DEBUG: Log model forward signature and DotProductAttention parameters.
         """
         print("=" * 100)
-        print("DEBUG STEP 2: MODEL FORWARD SIGNATURE")
+        print("DEBUG: MODEL FORWARD SIGNATURE")
         print("=" * 100)
 
-        # Check the wrapped model
         model = self.model
         print(f"Model type: {type(model)}")
 
-        # Try to get the inner model
-        if hasattr(model, '_fsdp_wrapped_module'):
-            inner = model._fsdp_wrapped_module
-            print(f"Inner model type: {type(inner)}")
-
-            # Check forward signature
-            try:
-                sig = inspect.signature(inner.forward)
-                params = list(sig.parameters.keys())
-                print(f"Inner model forward parameters: {params}")
-
-                # Check if position_ids is accepted
-                if 'position_ids' in params:
-                    print("  [OK] Model accepts 'position_ids' parameter")
-                else:
-                    print("  [WARNING] Model does NOT accept 'position_ids' parameter!")
-
-                # Check if attention_mask is accepted
-                if 'attention_mask' in params:
-                    print("  [OK] Model accepts 'attention_mask' parameter")
-                else:
-                    print("  [WARNING] Model does NOT accept 'attention_mask' parameter!")
-            except Exception as e:
-                print(f"Could not inspect inner model signature: {e}")
-
-        # Check TransformerLayer signature
-        try:
-            for name, module in model.named_modules():
-                if 'TransformerLayer' in type(module).__name__:
-                    sig = inspect.signature(module.forward)
-                    params = list(sig.parameters.keys())
-                    print(f"")
-                    print(f"TransformerLayer ({name}) forward parameters: {params}")
-                    break
-        except Exception as e:
-            print(f"Could not inspect TransformerLayer signature: {e}")
-
-        # Check rotary embedding
-        try:
-            for name, module in model.named_modules():
-                if 'Rotary' in type(module).__name__ or 'rotary' in name:
-                    print(f"")
-                    print(f"Rotary embedding module: {name}")
-                    print(f"  Type: {type(module)}")
-                    print(f"  Module: {module}")
-
-                    try:
-                        sig = inspect.signature(module.forward)
-                        params = list(sig.parameters.keys())
-                        print(f"  Forward parameters: {params}")
-                    except Exception:
-                        print("  Could not get forward signature")
-                    break
-        except Exception as e:
-            print(f"Could not inspect rotary embedding: {e}")
-
         # Check DotProductAttention signature
         try:
+            from transformer_engine.pytorch.attention import DotProductAttention
+            
             for name, module in model.named_modules():
-                if 'DotProductAttention' in type(module).__name__:
+                if isinstance(module, DotProductAttention):
                     sig = inspect.signature(module.forward)
                     params = list(sig.parameters.keys())
-                    print(f"")
-                    print(f"DotProductAttention forward parameters: {params}")
+                    print(f"\nDotProductAttention ({name}) forward parameters:")
+                    print(f"  {params}")
+                    
+                    # Check for cu_seqlens parameters
+                    if 'cu_seqlens_q' in params:
+                        print("  [OK] DotProductAttention accepts 'cu_seqlens_q'")
+                    else:
+                        print("  [WARNING] DotProductAttention does NOT accept 'cu_seqlens_q'!")
+                    
+                    if 'cu_seqlens_kv' in params:
+                        print("  [OK] DotProductAttention accepts 'cu_seqlens_kv'")
+                    
+                    if 'max_seqlen_q' in params:
+                        print("  [OK] DotProductAttention accepts 'max_seqlen_q'")
+                    
                     break
         except Exception as e:
-            print(f"Could not inspect DotProductAttention signature: {e}")
+            print(f"Could not inspect DotProductAttention: {e}")
 
-    def _debug_test_forward_variants(self, input_ids, attention_mask, labels, position_ids):
+        # Check hook registration
+        print(f"\nSequence packing hooks registered: {len(self._packing_hooks)}")
+
+    def _debug_verify_hooks_active(self):
         """
-        DEBUG STEP 3: Test forward pass with different parameter combinations.
-        """
-        print("=" * 100)
-        print("DEBUG STEP 3: FORWARD PASS VARIANTS TEST")
-        print("=" * 100)
-
-        seq_len = input_ids.shape[1]
-
-        # Prepare default position_ids for comparison
-        default_position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand_as(input_ids)
-
-        # Prepare 2D attention mask (if we have 3D)
-        if attention_mask is not None and attention_mask.dim() == 3:
-            attention_mask_2d = attention_mask.diagonal(dim1=-2, dim2=-1).long()
-        elif attention_mask is not None:
-            attention_mask_2d = attention_mask
-        else:
-            attention_mask_2d = None
-
-        tests = [
-            {
-                "name": "A: No attention_mask, no position_ids (baseline)",
-                "attention_mask": None,
-                "position_ids": None,
-            },
-            {
-                "name": "B: 2D attention_mask only",
-                "attention_mask": attention_mask_2d,
-                "position_ids": None,
-            },
-            {
-                "name": "C: Custom position_ids only",
-                "attention_mask": None,
-                "position_ids": position_ids,
-            },
-            {
-                "name": "D: Default position_ids (continuous)",
-                "attention_mask": None,
-                "position_ids": default_position_ids,
-            },
-            {
-                "name": "E: 2D attention_mask + custom position_ids",
-                "attention_mask": attention_mask_2d,
-                "position_ids": position_ids,
-            },
-        ]
-
-        # Only test 3D mask if it exists and is small enough
-        if attention_mask is not None and attention_mask.dim() == 3:
-            tests.append({
-                "name": "F: 3D attention_mask + custom position_ids",
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-            })
-
-        results = []
-
-        for test in tests:
-            test_name = test["name"]
-            try:
-                with torch.no_grad():
-                    forward_kwargs = {
-                        "input_ids": input_ids,
-                        "labels": labels,
-                    }
-                    if test["attention_mask"] is not None:
-                        forward_kwargs["attention_mask"] = test["attention_mask"]
-                    if test["position_ids"] is not None:
-                        forward_kwargs["position_ids"] = test["position_ids"]
-
-                    output = self.model(**forward_kwargs)
-                    loss = output["loss"].item() if isinstance(output, dict) else output.loss.item()
-
-                results.append((test_name, loss, "OK"))
-                print(f"  {test_name}: loss = {loss:.4f}")
-
-            except Exception as e:
-                results.append((test_name, None, str(e)[:100]))
-                print(f"  {test_name}: FAILED - {str(e)[:100]}")
-
-        # Analysis
-        print("")
-        print("  Analysis:")
-
-        # Compare C vs D (custom vs default position_ids)
-        loss_c = next((r[1] for r in results if "C:" in r[0] and r[1] is not None), None)
-        loss_d = next((r[1] for r in results if "D:" in r[0] and r[1] is not None), None)
-
-        if loss_c is not None and loss_d is not None:
-            diff = abs(loss_c - loss_d)
-            if diff < 0.001:
-                print(f"  [PROBLEM] Custom position_ids (C) vs default (D) have same loss!")
-                print(f"            This suggests position_ids are being IGNORED by the model.")
-            else:
-                print(f"  [OK] Custom position_ids affect loss (diff = {diff:.4f})")
-
-        # Compare A vs B (with/without attention mask)
-        loss_a = next((r[1] for r in results if "A:" in r[0] and r[1] is not None), None)
-        loss_b = next((r[1] for r in results if "B:" in r[0] and r[1] is not None), None)
-
-        if loss_a is not None and loss_b is not None:
-            diff = abs(loss_a - loss_b)
-            if diff < 0.001:
-                print(f"  [INFO] 2D attention_mask has minimal effect (diff = {diff:.4f})")
-            else:
-                print(f"  [INFO] 2D attention_mask affects loss (diff = {diff:.4f})")
-
-        # Check if 3D mask works
-        loss_f = next((r[1] for r in results if "F:" in r[0] and r[1] is not None), None)
-        if loss_f is not None and loss_c is not None:
-            diff = abs(loss_f - loss_c)
-            print(f"  [INFO] 3D mask vs no mask diff = {diff:.4f}")
-
-    def _debug_verify_rope_source(self):
-        """
-        DEBUG STEP 4: Check if RoPE implementation uses position_ids.
+        DEBUG: Verify that hooks are properly injecting cu_seqlens.
         """
         print("=" * 100)
-        print("DEBUG STEP 4: ROPE SOURCE CODE VERIFICATION")
+        print("DEBUG: HOOK VERIFICATION")
         print("=" * 100)
 
-        # Find rotary embedding module
-        rotary_module = None
-        rotary_name = None
-        for name, module in self.model.named_modules():
-            if 'rotary' in name.lower() or 'Rotary' in type(module).__name__:
-                rotary_module = module
-                rotary_name = name
-                break
-
-        if rotary_module is None:
-            print("  Could not find rotary embedding module")
-            return
-
-        print(f"  Found rotary module: {rotary_name}")
-        print(f"  Type: {type(rotary_module)}")
-
-        # Check source code if possible
-        try:
-            source = inspect.getsource(type(rotary_module).forward)
-
-            # Check if position_ids is used
-            if 'position_ids' in source or 'pos_ids' in source or 'seq_idx' in source:
-                print("  [OK] Rotary forward method references position_ids or similar")
-            else:
-                print("  [WARNING] Rotary forward method does NOT reference position_ids!")
-                print("  This means custom position_ids will have NO effect!")
-
-            # Log first 1000 chars of source
-            print(f"  Source preview (first 1000 chars):")
-            for line in source[:1000].split('\n'):
-                print(f"    {line}")
-
-        except Exception as e:
-            print(f"  Could not inspect rotary source: {e}")
+        print(f"_use_packing: {self._use_packing}")
+        print(f"Number of registered hooks: {len(self._packing_hooks)}")
+        print(f"_cu_seqlens_q is set: {self._cu_seqlens_q is not None}")
+        
+        if self._cu_seqlens_q is not None:
+            print(f"  Shape: {self._cu_seqlens_q.shape}")
+            print(f"  Device: {self._cu_seqlens_q.device}")
+            print(f"  Dtype: {self._cu_seqlens_q.dtype}")
+            print(f"  First 10 values: {self._cu_seqlens_q[:10].tolist()}")
 
     # =========================================================================
     # TRAINING STEP METHODS
@@ -902,10 +832,7 @@ class SageMakerNLPBaseModel(ModelPT):
         fp8_recipe = self.fp8_recipe
         fp8_group = tsm.state.world_process_group
 
-        input_ids, attention_mask, labels, position_ids = self._prepare_input_batch(batch, batch_idx)
-
-        # Check if sequence packing is enabled
-        use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
+        input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen = self._prepare_input_batch(batch, batch_idx)
 
         # =========================================================================
         # DEBUG: Log batch structure for first few batches
@@ -916,8 +843,8 @@ class SageMakerNLPBaseModel(ModelPT):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
-                position_ids=position_ids,
-                use_packing=use_packing
+                cu_seqlens_list=cu_seqlens_list,
+                max_seqlen=max_seqlen
             )
 
         # =========================================================================
@@ -925,49 +852,50 @@ class SageMakerNLPBaseModel(ModelPT):
         # =========================================================================
         if batch_idx == 0 and dist.get_rank() == 0:
             self._debug_log_model_signature()
-            self._debug_verify_rope_source()
 
         # =========================================================================
-        # DEBUG: Test forward variants on first batch
+        # SEQUENCE PACKING: Prepare cu_seqlens for hooks
+        # =========================================================================
+        if self._use_packing and cu_seqlens_list is not None:
+            self._prepare_cu_seqlens_for_batch(cu_seqlens_list, max_seqlen, input_ids.device)
+
+        # =========================================================================
+        # DEBUG: Verify hooks are active on first batch
         # =========================================================================
         if batch_idx == 0 and dist.get_rank() == 0:
-            self._debug_test_forward_variants(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                position_ids=position_ids
-            )
+            self._debug_verify_hooks_active()
 
-        with transformer_engine.pytorch.fp8_autocast(
-            enabled=fp8,
-            fp8_recipe=fp8_recipe,
-            fp8_group=fp8_group,
-        ):
-            forward_kwargs = {
-                "input_ids": input_ids,
-                "labels": labels,
-            }
+        try:
+            with transformer_engine.pytorch.fp8_autocast(
+                enabled=fp8,
+                fp8_recipe=fp8_recipe,
+                fp8_group=fp8_group,
+            ):
+                forward_kwargs = {
+                    "input_ids": input_ids,
+                    "labels": labels,
+                }
 
-            # Only add optional parameters if they exist
-            if use_packing:
-                if attention_mask is not None:
-                    forward_kwargs["attention_mask"] = attention_mask
-                if position_ids is not None:
-                    forward_kwargs["position_ids"] = position_ids
-            else:
-                # Standard mode: attention_mask=None (default causal)
-                forward_kwargs["attention_mask"] = None
+                # When using cu_seqlens, pass attention_mask=None to let cu_seqlens control attention
+                if self._use_packing and cu_seqlens_list is not None:
+                    forward_kwargs["attention_mask"] = None
+                else:
+                    # Standard mode: attention_mask=None (default causal)
+                    forward_kwargs["attention_mask"] = None
 
-            return self(*a, **forward_kwargs, **kw)["loss"]
+                return self(*a, **forward_kwargs, **kw)["loss"]
+        finally:
+            # =========================================================================
+            # SEQUENCE PACKING: Clear cu_seqlens state after forward pass
+            # =========================================================================
+            if self._use_packing:
+                self._clear_cu_seqlens()
 
     def _training_step(self, batch, batch_idx, *a, **kw):
         if self._cfg.get("multi_modal", None):
             return self(*a, **batch, **kw)["loss"]
 
-        input_ids, attention_mask, labels, position_ids = self._prepare_input_batch(batch, batch_idx)
-
-        # Check if sequence packing is enabled
-        use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
+        input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen = self._prepare_input_batch(batch, batch_idx)
 
         # =========================================================================
         # DEBUG: Log batch structure for first few batches
@@ -978,8 +906,8 @@ class SageMakerNLPBaseModel(ModelPT):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
-                position_ids=position_ids,
-                use_packing=use_packing
+                cu_seqlens_list=cu_seqlens_list,
+                max_seqlen=max_seqlen
             )
 
         # =========================================================================
@@ -987,35 +915,39 @@ class SageMakerNLPBaseModel(ModelPT):
         # =========================================================================
         if batch_idx == 0 and dist.get_rank() == 0:
             self._debug_log_model_signature()
-            self._debug_verify_rope_source()
 
         # =========================================================================
-        # DEBUG: Test forward variants on first batch
+        # SEQUENCE PACKING: Prepare cu_seqlens for hooks
+        # =========================================================================
+        if self._use_packing and cu_seqlens_list is not None:
+            self._prepare_cu_seqlens_for_batch(cu_seqlens_list, max_seqlen, input_ids.device)
+
+        # =========================================================================
+        # DEBUG: Verify hooks are active on first batch
         # =========================================================================
         if batch_idx == 0 and dist.get_rank() == 0:
-            self._debug_test_forward_variants(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                position_ids=position_ids
-            )
+            self._debug_verify_hooks_active()
 
-        forward_kwargs = {
-            "input_ids": input_ids,
-            "labels": labels,
-        }
+        try:
+            forward_kwargs = {
+                "input_ids": input_ids,
+                "labels": labels,
+            }
 
-        # Only add optional parameters if they exist
-        if use_packing:
-            if attention_mask is not None:
-                forward_kwargs["attention_mask"] = attention_mask
-            if position_ids is not None:
-                forward_kwargs["position_ids"] = position_ids
-        else:
-            # Standard mode: attention_mask=None (default causal)
-            forward_kwargs["attention_mask"] = None
+            # When using cu_seqlens, pass attention_mask=None to let cu_seqlens control attention
+            if self._use_packing and cu_seqlens_list is not None:
+                forward_kwargs["attention_mask"] = None
+            else:
+                # Standard mode: attention_mask=None (default causal)
+                forward_kwargs["attention_mask"] = None
 
-        return self(*a, **forward_kwargs, **kw)["loss"]
+            return self(*a, **forward_kwargs, **kw)["loss"]
+        finally:
+            # =========================================================================
+            # SEQUENCE PACKING: Clear cu_seqlens state after forward pass
+            # =========================================================================
+            if self._use_packing:
+                self._clear_cu_seqlens()
 
     def training_step(self, batch, batch_idx, *a, **kw):
         """
@@ -1031,7 +963,7 @@ class SageMakerNLPBaseModel(ModelPT):
         return self.loss
 
     def validation_step(self, batch, batch_idx):
-        """Validation step"""
+        """Validation step with sequence packing support"""
         if self._cfg.get("dpo", False):
             prompt_ids, prompt_mask, chosen_ids, chosen_mask, rejected_ids, rejected_mask = (
                 self._prepare_dpo_input_batch(batch, batch_idx)
@@ -1053,27 +985,33 @@ class SageMakerNLPBaseModel(ModelPT):
             }
             val_loss = compute_dpo_loss(**dpo_params)
         else:
-            input_ids, attention_mask, labels, position_ids = self._prepare_input_batch(batch, batch_idx)
+            input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen = self._prepare_input_batch(batch, batch_idx)
 
-            # Check if sequence packing is enabled
-            use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
+            # =========================================================================
+            # SEQUENCE PACKING: Prepare cu_seqlens for hooks
+            # =========================================================================
+            if self._use_packing and cu_seqlens_list is not None:
+                self._prepare_cu_seqlens_for_batch(cu_seqlens_list, max_seqlen, input_ids.device)
 
-            forward_kwargs = {
-                "input_ids": input_ids,
-                "labels": labels,
-            }
+            try:
+                forward_kwargs = {
+                    "input_ids": input_ids,
+                    "labels": labels,
+                }
 
-            # Only add optional parameters if they exist
-            if use_packing:
-                if attention_mask is not None:
-                    forward_kwargs["attention_mask"] = attention_mask
-                if position_ids is not None:
-                    forward_kwargs["position_ids"] = position_ids
-            else:
-                # Standard mode: attention_mask=None (default causal)
-                forward_kwargs["attention_mask"] = None
+                # When using cu_seqlens, pass attention_mask=None to let cu_seqlens control attention
+                if self._use_packing and cu_seqlens_list is not None:
+                    forward_kwargs["attention_mask"] = None
+                else:
+                    forward_kwargs["attention_mask"] = None
 
-            val_loss = self(**forward_kwargs)["loss"]
+                val_loss = self(**forward_kwargs)["loss"]
+            finally:
+                # =========================================================================
+                # SEQUENCE PACKING: Clear cu_seqlens state after forward pass
+                # =========================================================================
+                if self._use_packing:
+                    self._clear_cu_seqlens()
 
         self.val_loss += val_loss.detach()
         return val_loss
@@ -1105,45 +1043,58 @@ class SageMakerNLPBaseModel(ModelPT):
 
     def _prepare_input_batch(self, batch, batch_idx):
         """
-        Parse input batch, pre-process for context parallel
+        Parse input batch, pre-process for context parallel.
+        
         Supports both:
         - Standard mode: (input_ids, attention_mask, labels)
-        - Sequence packing mode: (input_ids, attention_mask, labels, position_ids)
+        - Sequence packing mode: (input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen)
+        
+        Returns:
+            Tuple of (input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen)
+            cu_seqlens_list and max_seqlen are None for standard (non-packed) batches.
         """
-        # Check if sequence packing is enabled
-        use_packing = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
-
         batch_data = self.trainer.datamodule.get_batch(batch)
 
-        if use_packing and len(batch_data) == 4:
-            # Sequence packing mode: extract all 4 components
-            input_ids, attention_mask, labels, position_ids = batch_data
+        if self._use_packing and len(batch_data) == 5:
+            # Sequence packing mode: extract all 5 components
+            input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen = batch_data
         elif len(batch_data) == 3:
             # Standard mode: only 3 components
             input_ids, attention_mask, labels = batch_data
-            position_ids = None
+            cu_seqlens_list = None
+            max_seqlen = None
+        elif len(batch_data) == 4:
+            # Legacy packing mode with position_ids (fallback)
+            input_ids, attention_mask, labels, _ = batch_data
+            cu_seqlens_list = None
+            max_seqlen = None
+            if dist.get_rank() == 0 and batch_idx == 0:
+                _logger.warning("Received 4-tuple batch (legacy position_ids mode). cu_seqlens not available.")
         else:
             # Fallback for legacy format where attention_mask might be ignored
-            input_ids, _, labels = batch_data
+            input_ids, _, labels = batch_data[:3]
             attention_mask = None
-            position_ids = None
+            cu_seqlens_list = None
+            max_seqlen = None
 
         self.batch_num_sequences = input_ids.shape[0]
 
         if self._cfg.get("context_parallel_degree", 1) > 1:
-            if use_packing and position_ids is not None:
-                # Pack all components for context parallel
-                input_ids, attention_mask, labels, position_ids = get_batch_for_cp_rank(
-                    (input_ids, attention_mask, labels, position_ids)
-                )
-            elif attention_mask is not None:
-                # Pack with attention mask but no position_ids
+            # Note: cu_seqlens handling with context parallel requires careful consideration
+            # For now, we only split input_ids, attention_mask, labels
+            if attention_mask is not None:
                 input_ids, attention_mask, labels = get_batch_for_cp_rank(
                     (input_ids, attention_mask, labels)
                 )
             else:
-                # Legacy: only input_ids and labels
                 input_ids, labels = get_batch_for_cp_rank((input_ids, labels))
+            
+            # TODO: cu_seqlens would need to be adjusted for context parallel
+            # For now, disable cu_seqlens with CP
+            if cu_seqlens_list is not None and dist.get_rank() == 0 and batch_idx == 0:
+                _logger.warning("cu_seqlens sequence packing with context_parallel_degree > 1 is not yet supported. Disabling cu_seqlens.")
+                cu_seqlens_list = None
+                max_seqlen = None
 
         if batch_idx == 0 and dist.get_rank() == 0:
             # checking only on batch 0 to reduce checks during runtime
@@ -1156,7 +1107,7 @@ class SageMakerNLPBaseModel(ModelPT):
                     f"(model.max_context_width / model.context_parallel_degree)."
                 )
 
-        return input_ids, attention_mask, labels, position_ids
+        return input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen
 
     def _compute_packed_sequence_loss(self, logits, labels):
         """
