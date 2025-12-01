@@ -97,11 +97,7 @@ class SageMakerNLPBaseModel(ModelPT):
         use_packing_from_env = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
         self._use_packing = use_packing_from_config if use_packing_from_config is not None else use_packing_from_env
         
-        if self._use_packing and dist.get_rank() == 0:
-            _logger.info("=" * 80)
-            _logger.info("SEQUENCE PACKING MODE ENABLED (cu_seqlens approach)")
-            _logger.info("  cu_seqlens will be injected into DotProductAttention via hooks")
-            _logger.info("=" * 80)
+        # Note: Logging deferred to setup() since dist may not be initialized yet
         # =========================================================================
 
         self.set_config_mapping_hf_to_recipe_aliases()
@@ -343,6 +339,16 @@ class SageMakerNLPBaseModel(ModelPT):
     # =========================================================================
 
     def setup(self, *a, **kw):
+        # =========================================================================
+        # SEQUENCE PACKING: Log mode now that dist is initialized
+        # =========================================================================
+        if self._use_packing and dist.get_rank() == 0:
+            _logger.info("=" * 80)
+            _logger.info("SEQUENCE PACKING MODE ENABLED (cu_seqlens approach)")
+            _logger.info("  cu_seqlens will be injected into DotProductAttention via hooks")
+            _logger.info("=" * 80)
+        # =========================================================================
+        
         if self.do_patch_mllama:
             patch_mllama_dtype.apply_patch(dtype=torch.bfloat16 if self._cfg.precision == "bf16" else torch.float32)
         if self.do_patch_attn_context_parallel:
