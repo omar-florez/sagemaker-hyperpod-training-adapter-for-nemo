@@ -11,6 +11,23 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 
+"""
+SageMaker NLP Base Model with Sequence Packing Support
+
+Supports two modes for sequence packing:
+
+1. use_smp_model=True (SMP/TransformerEngine mode):
+   - Uses cu_seqlens hooks injected into DotProductAttention
+   - position_ids ignored (PatchedRotaryPositionEmbedding uses torch.arange)
+   - Requires THD tensor format (may have compatibility issues)
+
+2. use_smp_model=False (Native HuggingFace mode):
+   - Uses position_ids (reset per document) passed to model.forward()
+   - Uses 4D block-diagonal attention_mask
+   - Works with HuggingFace FlashAttention2
+   - No tensor parallelism, FSDP only
+"""
+
 import inspect
 import math
 import os
@@ -64,7 +81,9 @@ class SageMakerNLPBaseModel(ModelPT):
     and training/eval behaviors.
     User will need to either consume the provided inheritors or inherit and implement their own model class.
     
-    Supports sequence packing via cu_seqlens injection into TransformerEngine DotProductAttention.
+    Supports sequence packing via:
+    - cu_seqlens injection into TransformerEngine DotProductAttention (use_smp_model=True)
+    - position_ids + 4D attention_mask for HuggingFace models (use_smp_model=False)
     """
 
     # Whether if the model is predefined
@@ -84,8 +103,9 @@ class SageMakerNLPBaseModel(ModelPT):
         self._config_mapping_hf_to_recipe_aliases = None
 
         # =========================================================================
-        # SEQUENCE PACKING STATE (cu_seqlens approach)
+        # SEQUENCE PACKING STATE
         # =========================================================================
+        # For SMP mode (cu_seqlens approach)
         self._cu_seqlens_q = None
         self._cu_seqlens_kv = None
         self._max_seqlen_q = None
@@ -93,7 +113,9 @@ class SageMakerNLPBaseModel(ModelPT):
         self._packing_hooks = []
         
         # Check if sequence packing is enabled via config or environment
-        use_packing_from_config = cfg.model.data.get("use_sequence_packing", None) if hasattr(cfg, 'model') and hasattr(cfg.model, 'data') else None
+        use_packing_from_config = None
+        if hasattr(cfg, 'model') and hasattr(cfg.model, 'data'):
+            use_packing_from_config = cfg.model.data.get("use_sequence_packing", None)
         use_packing_from_env = os.environ.get("USE_SEQUENCE_PACKING", "false").lower() == "true"
         self._use_packing = use_packing_from_config if use_packing_from_config is not None else use_packing_from_env
         
@@ -189,7 +211,7 @@ class SageMakerNLPBaseModel(ModelPT):
         )
 
     # =========================================================================
-    # SEQUENCE PACKING: cu_seqlens HOOK METHODS
+    # SEQUENCE PACKING: cu_seqlens HOOK METHODS (for use_smp_model=True)
     # =========================================================================
 
     def _register_packing_hooks(self):
@@ -199,8 +221,15 @@ class SageMakerNLPBaseModel(ModelPT):
         
         This enables TransformerEngine to properly isolate attention
         between packed documents without cross-document attention.
+        
+        Only used when use_smp_model=True.
         """
         if not self._use_packing:
+            return
+        
+        if not self.use_smp_model:
+            if dist.get_rank() == 0:
+                _logger.info("Skipping cu_seqlens hooks (use_smp_model=False, using position_ids + attention_mask)")
             return
         
         try:
@@ -335,7 +364,7 @@ class SageMakerNLPBaseModel(ModelPT):
         self._max_seqlen_kv = None
 
     # =========================================================================
-    # END SEQUENCE PACKING METHODS
+    # END SEQUENCE PACKING cu_seqlens METHODS
     # =========================================================================
 
     def setup(self, *a, **kw):
@@ -344,8 +373,13 @@ class SageMakerNLPBaseModel(ModelPT):
         # =========================================================================
         if self._use_packing and dist.get_rank() == 0:
             _logger.info("=" * 80)
-            _logger.info("SEQUENCE PACKING MODE ENABLED (cu_seqlens approach)")
-            _logger.info("  cu_seqlens will be injected into DotProductAttention via hooks")
+            if self.use_smp_model:
+                _logger.info("SEQUENCE PACKING MODE ENABLED (cu_seqlens approach for SMP)")
+                _logger.info("  cu_seqlens will be injected into DotProductAttention via hooks")
+            else:
+                _logger.info("SEQUENCE PACKING MODE ENABLED (position_ids + attention_mask for HuggingFace)")
+                _logger.info("  position_ids resets per document")
+                _logger.info("  4D block-diagonal attention_mask passed to model.forward()")
             _logger.info("=" * 80)
         # =========================================================================
         
@@ -404,9 +438,9 @@ class SageMakerNLPBaseModel(ModelPT):
         self.fp8_recipe = self._fp8_delayed_scaling()
         
         # =========================================================================
-        # SEQUENCE PACKING: Register hooks after model is ready
+        # SEQUENCE PACKING: Register hooks after model is ready (SMP mode only)
         # =========================================================================
-        if self._use_packing:
+        if self._use_packing and self.use_smp_model:
             self._register_packing_hooks()
         # =========================================================================
 
@@ -599,17 +633,19 @@ class SageMakerNLPBaseModel(ModelPT):
     # DEBUG METHODS FOR SEQUENCE PACKING
     # =========================================================================
 
-    def _debug_log_batch_structure(self, batch_idx, input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen):
+    def _debug_log_batch_structure(self, batch_idx, input_ids, attention_mask, labels, 
+                                   position_ids, cu_seqlens_list, max_seqlen):
         """
-        DEBUG: Log complete batch structure to understand data flow for cu_seqlens mode.
+        DEBUG: Log complete batch structure to understand data flow.
         """
         print("=" * 100)
-        print(f"DEBUG: BATCH STRUCTURE (batch_idx={batch_idx}) - cu_seqlens mode")
+        print(f"DEBUG: BATCH STRUCTURE (batch_idx={batch_idx})")
         print("=" * 100)
 
         batch_size, seq_len = input_ids.shape
         print(f"Batch size: {batch_size}, Sequence length: {seq_len}")
         print(f"use_packing: {self._use_packing}")
+        print(f"use_smp_model: {self.use_smp_model}")
 
         # Get tokenizer info
         try:
@@ -622,6 +658,28 @@ class SageMakerNLPBaseModel(ModelPT):
 
         IGNORE_INDEX = -100
 
+        # Log position_ids info
+        if position_ids is not None:
+            print(f"\nposition_ids shape: {position_ids.shape}")
+            print(f"  Sample 0 first 20: {position_ids[0, :20].tolist()}")
+            # Find where position resets (indicates document boundary)
+            pos_diff = position_ids[0, 1:] - position_ids[0, :-1]
+            reset_positions = (pos_diff < 0).nonzero(as_tuple=True)[0].tolist()
+            print(f"  Position resets at: {reset_positions[:10]}...")
+        else:
+            print("\nposition_ids: None")
+
+        # Log attention_mask info
+        if attention_mask is not None:
+            print(f"\nattention_mask shape: {attention_mask.shape}")
+            if attention_mask.dim() == 4:
+                print(f"  4D mask detected (block-diagonal)")
+                print(f"  min: {attention_mask.min().item():.2f}, max: {attention_mask.max().item():.2f}")
+            elif attention_mask.dim() == 2:
+                print(f"  2D mask detected (standard)")
+        else:
+            print("\nattention_mask: None")
+
         # Log cu_seqlens info
         if cu_seqlens_list is not None:
             print(f"\ncu_seqlens_list: {len(cu_seqlens_list)} samples")
@@ -630,108 +688,20 @@ class SageMakerNLPBaseModel(ModelPT):
                 print(f"           num_docs={len(cu_seqlens)-1}, last_value={cu_seqlens[-1].item()}")
             print(f"max_seqlen: {max_seqlen}")
         else:
-            print("\ncu_seqlens_list: None (standard mode)")
+            print("\ncu_seqlens_list: None")
 
-        for sample_idx in range(min(batch_size, 2)):  # Log first 2 samples
-            print("-" * 80)
-            print(f"SAMPLE {sample_idx}:")
-            print("-" * 80)
+        # Log labels info
+        num_masked = (labels[0] == IGNORE_INDEX).sum().item()
+        num_valid = seq_len - num_masked
+        print(f"\nLabels:")
+        print(f"  Masked (IGNORE_INDEX): {num_masked}")
+        print(f"  Valid: {num_valid}")
 
-            ids = input_ids[sample_idx].cpu()
-            lab = labels[sample_idx].cpu()
-
-            # Find EOS positions
-            eos_positions = (ids == eos_token_id).nonzero(as_tuple=True)[0].tolist()
-            print(f"  EOS positions: {eos_positions[:20]}{'...' if len(eos_positions) > 20 else ''}")
-            print(f"  Number of EOS tokens: {len(eos_positions)}")
-
-            # Find padding (attention_mask == 0)
-            padding_start = seq_len
-            if attention_mask is not None and attention_mask.dim() == 2:
-                mask = attention_mask[sample_idx].cpu()
-                padding_positions = (mask == 0).nonzero(as_tuple=True)[0]
-                if len(padding_positions) > 0:
-                    padding_start = padding_positions[0].item()
-
-            print(f"  Padding starts at position: {padding_start}")
-            print(f"  Real content length: {padding_start}")
-
-            # Find IGNORE_INDEX positions in labels
-            ignored_positions = (lab == IGNORE_INDEX).nonzero(as_tuple=True)[0].tolist()
-            print(f"  Labels with IGNORE_INDEX (-100): {len(ignored_positions)} positions")
-
-            # Verify cu_seqlens matches EOS positions
-            if cu_seqlens_list is not None and sample_idx < len(cu_seqlens_list):
-                cu_seqlens = cu_seqlens_list[sample_idx]
-                # cu_seqlens should be [0, eos1+1, eos2+1, ...] 
-                expected_boundaries = [0] + [pos + 1 for pos in eos_positions if pos + 1 <= padding_start]
-                
-                # Check if there's trailing content after last EOS
-                if eos_positions and eos_positions[-1] + 1 < padding_start:
-                    expected_boundaries.append(padding_start)
-                
-                actual_boundaries = cu_seqlens.tolist()
-                
-                print(f"\n  cu_seqlens verification:")
-                print(f"    Expected (from EOS): {expected_boundaries[:10]}{'...' if len(expected_boundaries) > 10 else ''}")
-                print(f"    Actual cu_seqlens:   {actual_boundaries[:10]}{'...' if len(actual_boundaries) > 10 else ''}")
-                
-                if expected_boundaries[:10] == actual_boundaries[:10]:
-                    print(f"    [OK] cu_seqlens matches EOS positions")
-                else:
-                    print(f"    [WARNING] cu_seqlens does NOT match EOS positions!")
-
-            # Show document structure
-            print(f"\n  Document structure (first 5 docs):")
-            if cu_seqlens_list is not None and sample_idx < len(cu_seqlens_list):
-                cu_seqlens = cu_seqlens_list[sample_idx]
-                for doc_idx in range(min(5, len(cu_seqlens) - 1)):
-                    doc_start = cu_seqlens[doc_idx].item()
-                    doc_end = cu_seqlens[doc_idx + 1].item()
-                    doc_len = doc_end - doc_start
-                    
-                    # Count ignored labels in this document
-                    doc_labels = lab[doc_start:doc_end].tolist()
-                    ignored_in_doc = sum(1 for l in doc_labels if l == IGNORE_INDEX)
-                    
-                    print(f"    Doc {doc_idx}: positions [{doc_start}:{doc_end}] (len={doc_len}), ignored_labels={ignored_in_doc}")
-
-            # Show token alignment around first few EOS positions
-            print(f"\n  Token alignment around EOS positions:")
-            print(f"  {'Pos':>5} | {'InputID':>8} | {'Label':>8} | Notes")
-            print(f"  {'-'*5}-+-{'-'*8}-+-{'-'*8}-+-{'-'*30}")
-
-            positions_to_show = set()
-            for eos_pos in eos_positions[:5]:
-                positions_to_show.add(max(0, eos_pos - 1))
-                positions_to_show.add(eos_pos)
-                positions_to_show.add(min(seq_len - 1, eos_pos + 1))
-
-            last_printed = -2
-            for pos in sorted(positions_to_show):
-                if pos >= seq_len:
-                    continue
-                if pos > last_printed + 1 and last_printed >= 0:
-                    print(f"  {'...':>5} |")
-
-                input_id = ids[pos].item()
-                label = lab[pos].item()
-
-                notes = []
-                if input_id == eos_token_id:
-                    notes.append("EOS")
-                if label == IGNORE_INDEX:
-                    notes.append("MASKED")
-                if pos in eos_positions:
-                    notes.append("<-- DOC BOUNDARY")
-
-                notes_str = ", ".join(notes) if notes else ""
-                print(f"  {pos:>5} | {input_id:>8} | {label:>8} | {notes_str}")
-                last_printed = pos
+        print("=" * 100)
 
     def _debug_log_model_signature(self):
         """
-        DEBUG: Log model forward signature and DotProductAttention parameters.
+        DEBUG: Log model forward signature.
         """
         print("=" * 100)
         print("DEBUG: MODEL FORWARD SIGNATURE")
@@ -739,54 +709,41 @@ class SageMakerNLPBaseModel(ModelPT):
 
         model = self.model
         print(f"Model type: {type(model)}")
+        print(f"use_smp_model: {self.use_smp_model}")
 
-        # Check DotProductAttention signature
+        # Get forward signature
         try:
-            from transformer_engine.pytorch.attention import DotProductAttention
+            sig = inspect.signature(model.forward)
+            params = list(sig.parameters.keys())
+            print(f"\nModel.forward() parameters:")
+            print(f"  {params}")
             
-            for name, module in model.named_modules():
-                if isinstance(module, DotProductAttention):
-                    sig = inspect.signature(module.forward)
-                    params = list(sig.parameters.keys())
-                    print(f"\nDotProductAttention ({name}) forward parameters:")
-                    print(f"  {params}")
-                    
-                    # Check for cu_seqlens parameters
-                    if 'cu_seqlens_q' in params:
-                        print("  [OK] DotProductAttention accepts 'cu_seqlens_q'")
-                    else:
-                        print("  [WARNING] DotProductAttention does NOT accept 'cu_seqlens_q'!")
-                    
-                    if 'cu_seqlens_kv' in params:
-                        print("  [OK] DotProductAttention accepts 'cu_seqlens_kv'")
-                    
-                    if 'max_seqlen_q' in params:
-                        print("  [OK] DotProductAttention accepts 'max_seqlen_q'")
-                    
-                    break
+            if 'position_ids' in params:
+                print("  [OK] Model accepts 'position_ids'")
+            else:
+                print("  [WARNING] Model does NOT accept 'position_ids'")
+            
+            if 'attention_mask' in params:
+                print("  [OK] Model accepts 'attention_mask'")
         except Exception as e:
-            print(f"Could not inspect DotProductAttention: {e}")
+            print(f"Could not inspect model.forward: {e}")
 
-        # Check hook registration
-        print(f"\nSequence packing hooks registered: {len(self._packing_hooks)}")
+        # Check for DotProductAttention (SMP mode)
+        if self.use_smp_model:
+            try:
+                from transformer_engine.pytorch.attention import DotProductAttention
+                
+                dpa_count = 0
+                for name, module in model.named_modules():
+                    if isinstance(module, DotProductAttention):
+                        dpa_count += 1
+                
+                print(f"\nDotProductAttention modules found: {dpa_count}")
+                print(f"Sequence packing hooks registered: {len(self._packing_hooks)}")
+            except Exception as e:
+                print(f"Could not check DotProductAttention: {e}")
 
-    def _debug_verify_hooks_active(self):
-        """
-        DEBUG: Verify that hooks are properly injecting cu_seqlens.
-        """
         print("=" * 100)
-        print("DEBUG: HOOK VERIFICATION")
-        print("=" * 100)
-
-        print(f"_use_packing: {self._use_packing}")
-        print(f"Number of registered hooks: {len(self._packing_hooks)}")
-        print(f"_cu_seqlens_q is set: {self._cu_seqlens_q is not None}")
-        
-        if self._cu_seqlens_q is not None:
-            print(f"  Shape: {self._cu_seqlens_q.shape}")
-            print(f"  Device: {self._cu_seqlens_q.device}")
-            print(f"  Dtype: {self._cu_seqlens_q.dtype}")
-            print(f"  First 10 values: {self._cu_seqlens_q[:10].tolist()}")
 
     # =========================================================================
     # TRAINING STEP METHODS
@@ -838,7 +795,7 @@ class SageMakerNLPBaseModel(ModelPT):
         fp8_recipe = self.fp8_recipe
         fp8_group = tsm.state.world_process_group
 
-        input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen = self._prepare_input_batch(batch, batch_idx)
+        input_ids, attention_mask, labels, position_ids, cu_seqlens_list, max_seqlen = self._prepare_input_batch(batch, batch_idx)
 
         # =========================================================================
         # DEBUG: Log batch structure for first few batches
@@ -849,6 +806,7 @@ class SageMakerNLPBaseModel(ModelPT):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
+                position_ids=position_ids,
                 cu_seqlens_list=cu_seqlens_list,
                 max_seqlen=max_seqlen
             )
@@ -860,16 +818,10 @@ class SageMakerNLPBaseModel(ModelPT):
             self._debug_log_model_signature()
 
         # =========================================================================
-        # SEQUENCE PACKING: Prepare cu_seqlens for hooks
+        # SEQUENCE PACKING: Prepare cu_seqlens for hooks (SMP mode)
         # =========================================================================
-        if self._use_packing and cu_seqlens_list is not None:
+        if self._use_packing and self.use_smp_model and cu_seqlens_list is not None:
             self._prepare_cu_seqlens_for_batch(cu_seqlens_list, max_seqlen, input_ids.device)
-
-        # =========================================================================
-        # DEBUG: Verify hooks are active on first batch
-        # =========================================================================
-        if batch_idx == 0 and dist.get_rank() == 0:
-            self._debug_verify_hooks_active()
 
         try:
             with transformer_engine.pytorch.fp8_autocast(
@@ -882,11 +834,19 @@ class SageMakerNLPBaseModel(ModelPT):
                     "labels": labels,
                 }
 
-                # When using cu_seqlens, pass attention_mask=None to let cu_seqlens control attention
-                if self._use_packing and cu_seqlens_list is not None:
-                    forward_kwargs["attention_mask"] = None
+                # Mode-specific handling
+                if self._use_packing:
+                    if self.use_smp_model:
+                        # SMP mode: cu_seqlens via hooks, no position_ids/attention_mask
+                        forward_kwargs["attention_mask"] = None
+                    else:
+                        # HuggingFace mode: pass position_ids and 4D attention_mask
+                        if position_ids is not None:
+                            forward_kwargs["position_ids"] = position_ids
+                        if attention_mask is not None:
+                            forward_kwargs["attention_mask"] = attention_mask
                 else:
-                    # Standard mode: attention_mask=None (default causal)
+                    # Standard mode (no packing)
                     forward_kwargs["attention_mask"] = None
 
                 return self(*a, **forward_kwargs, **kw)["loss"]
@@ -894,14 +854,14 @@ class SageMakerNLPBaseModel(ModelPT):
             # =========================================================================
             # SEQUENCE PACKING: Clear cu_seqlens state after forward pass
             # =========================================================================
-            if self._use_packing:
+            if self._use_packing and self.use_smp_model:
                 self._clear_cu_seqlens()
 
     def _training_step(self, batch, batch_idx, *a, **kw):
         if self._cfg.get("multi_modal", None):
             return self(*a, **batch, **kw)["loss"]
 
-        input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen = self._prepare_input_batch(batch, batch_idx)
+        input_ids, attention_mask, labels, position_ids, cu_seqlens_list, max_seqlen = self._prepare_input_batch(batch, batch_idx)
 
         # =========================================================================
         # DEBUG: Log batch structure for first few batches
@@ -912,6 +872,7 @@ class SageMakerNLPBaseModel(ModelPT):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
+                position_ids=position_ids,
                 cu_seqlens_list=cu_seqlens_list,
                 max_seqlen=max_seqlen
             )
@@ -923,16 +884,10 @@ class SageMakerNLPBaseModel(ModelPT):
             self._debug_log_model_signature()
 
         # =========================================================================
-        # SEQUENCE PACKING: Prepare cu_seqlens for hooks
+        # SEQUENCE PACKING: Prepare cu_seqlens for hooks (SMP mode)
         # =========================================================================
-        if self._use_packing and cu_seqlens_list is not None:
+        if self._use_packing and self.use_smp_model and cu_seqlens_list is not None:
             self._prepare_cu_seqlens_for_batch(cu_seqlens_list, max_seqlen, input_ids.device)
-
-        # =========================================================================
-        # DEBUG: Verify hooks are active on first batch
-        # =========================================================================
-        if batch_idx == 0 and dist.get_rank() == 0:
-            self._debug_verify_hooks_active()
 
         try:
             forward_kwargs = {
@@ -940,11 +895,19 @@ class SageMakerNLPBaseModel(ModelPT):
                 "labels": labels,
             }
 
-            # When using cu_seqlens, pass attention_mask=None to let cu_seqlens control attention
-            if self._use_packing and cu_seqlens_list is not None:
-                forward_kwargs["attention_mask"] = None
+            # Mode-specific handling
+            if self._use_packing:
+                if self.use_smp_model:
+                    # SMP mode: cu_seqlens via hooks, no position_ids/attention_mask
+                    forward_kwargs["attention_mask"] = None
+                else:
+                    # HuggingFace mode: pass position_ids and 4D attention_mask
+                    if position_ids is not None:
+                        forward_kwargs["position_ids"] = position_ids
+                    if attention_mask is not None:
+                        forward_kwargs["attention_mask"] = attention_mask
             else:
-                # Standard mode: attention_mask=None (default causal)
+                # Standard mode (no packing)
                 forward_kwargs["attention_mask"] = None
 
             return self(*a, **forward_kwargs, **kw)["loss"]
@@ -952,7 +915,7 @@ class SageMakerNLPBaseModel(ModelPT):
             # =========================================================================
             # SEQUENCE PACKING: Clear cu_seqlens state after forward pass
             # =========================================================================
-            if self._use_packing:
+            if self._use_packing and self.use_smp_model:
                 self._clear_cu_seqlens()
 
     def training_step(self, batch, batch_idx, *a, **kw):
@@ -991,12 +954,12 @@ class SageMakerNLPBaseModel(ModelPT):
             }
             val_loss = compute_dpo_loss(**dpo_params)
         else:
-            input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen = self._prepare_input_batch(batch, batch_idx)
+            input_ids, attention_mask, labels, position_ids, cu_seqlens_list, max_seqlen = self._prepare_input_batch(batch, batch_idx)
 
             # =========================================================================
-            # SEQUENCE PACKING: Prepare cu_seqlens for hooks
+            # SEQUENCE PACKING: Prepare cu_seqlens for hooks (SMP mode)
             # =========================================================================
-            if self._use_packing and cu_seqlens_list is not None:
+            if self._use_packing and self.use_smp_model and cu_seqlens_list is not None:
                 self._prepare_cu_seqlens_for_batch(cu_seqlens_list, max_seqlen, input_ids.device)
 
             try:
@@ -1005,18 +968,21 @@ class SageMakerNLPBaseModel(ModelPT):
                     "labels": labels,
                 }
 
-                # When using cu_seqlens, pass attention_mask=None to let cu_seqlens control attention
-                if self._use_packing and cu_seqlens_list is not None:
-                    forward_kwargs["attention_mask"] = None
+                # Mode-specific handling
+                if self._use_packing:
+                    if self.use_smp_model:
+                        forward_kwargs["attention_mask"] = None
+                    else:
+                        if position_ids is not None:
+                            forward_kwargs["position_ids"] = position_ids
+                        if attention_mask is not None:
+                            forward_kwargs["attention_mask"] = attention_mask
                 else:
                     forward_kwargs["attention_mask"] = None
 
                 val_loss = self(**forward_kwargs)["loss"]
             finally:
-                # =========================================================================
-                # SEQUENCE PACKING: Clear cu_seqlens state after forward pass
-                # =========================================================================
-                if self._use_packing:
+                if self._use_packing and self.use_smp_model:
                     self._clear_cu_seqlens()
 
         self.val_loss += val_loss.detach()
@@ -1051,54 +1017,64 @@ class SageMakerNLPBaseModel(ModelPT):
         """
         Parse input batch, pre-process for context parallel.
         
-        Supports both:
+        Supports multiple modes:
         - Standard mode: (input_ids, attention_mask, labels)
-        - Sequence packing mode: (input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen)
+        - Sequence packing mode: (input_ids, attention_mask, labels, position_ids, cu_seqlens_list, max_seqlen)
         
         Returns:
-            Tuple of (input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen)
-            cu_seqlens_list and max_seqlen are None for standard (non-packed) batches.
+            Tuple of (input_ids, attention_mask, labels, position_ids, cu_seqlens_list, max_seqlen)
+            position_ids, cu_seqlens_list and max_seqlen are None for standard (non-packed) batches.
         """
         batch_data = self.trainer.datamodule.get_batch(batch)
 
-        if self._use_packing and len(batch_data) == 5:
-            # Sequence packing mode: extract all 5 components
+        # Initialize defaults
+        position_ids = None
+        cu_seqlens_list = None
+        max_seqlen = None
+
+        if self._use_packing and len(batch_data) == 6:
+            # New packing mode: 6-tuple with position_ids
+            input_ids, attention_mask, labels, position_ids, cu_seqlens_list, max_seqlen = batch_data
+        elif self._use_packing and len(batch_data) == 5:
+            # Legacy packing mode: 5-tuple without position_ids
             input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen = batch_data
+            if dist.get_rank() == 0 and batch_idx == 0:
+                _logger.warning("Received 5-tuple batch (legacy mode without position_ids).")
         elif len(batch_data) == 3:
             # Standard mode: only 3 components
             input_ids, attention_mask, labels = batch_data
-            cu_seqlens_list = None
-            max_seqlen = None
         elif len(batch_data) == 4:
-            # Legacy packing mode with position_ids (fallback)
-            input_ids, attention_mask, labels, _ = batch_data
-            cu_seqlens_list = None
-            max_seqlen = None
+            # Legacy mode with position_ids only (no cu_seqlens)
+            input_ids, attention_mask, labels, position_ids = batch_data
             if dist.get_rank() == 0 and batch_idx == 0:
-                _logger.warning("Received 4-tuple batch (legacy position_ids mode). cu_seqlens not available.")
+                _logger.info("Received 4-tuple batch with position_ids.")
         else:
-            # Fallback for legacy format where attention_mask might be ignored
-            input_ids, _, labels = batch_data[:3]
-            attention_mask = None
-            cu_seqlens_list = None
-            max_seqlen = None
+            # Fallback
+            input_ids = batch_data[0]
+            attention_mask = batch_data[1] if len(batch_data) > 1 else None
+            labels = batch_data[2] if len(batch_data) > 2 else input_ids.clone()
+            if dist.get_rank() == 0 and batch_idx == 0:
+                _logger.warning(f"Unexpected batch format with {len(batch_data)} elements.")
 
         self.batch_num_sequences = input_ids.shape[0]
 
         if self._cfg.get("context_parallel_degree", 1) > 1:
-            # Note: cu_seqlens handling with context parallel requires careful consideration
-            # For now, we only split input_ids, attention_mask, labels
-            if attention_mask is not None:
-                input_ids, attention_mask, labels = get_batch_for_cp_rank(
-                    (input_ids, attention_mask, labels)
-                )
+            # Context parallel processing
+            # Note: position_ids and cu_seqlens handling with CP requires careful consideration
+            tensors_to_split = [input_ids, labels]
+            if attention_mask is not None and attention_mask.dim() == 2:
+                tensors_to_split.append(attention_mask)
+                split_result = get_batch_for_cp_rank(tuple(tensors_to_split))
+                input_ids, labels, attention_mask = split_result
             else:
-                input_ids, labels = get_batch_for_cp_rank((input_ids, labels))
+                split_result = get_batch_for_cp_rank(tuple(tensors_to_split))
+                input_ids, labels = split_result
             
-            # TODO: cu_seqlens would need to be adjusted for context parallel
-            # For now, disable cu_seqlens with CP
-            if cu_seqlens_list is not None and dist.get_rank() == 0 and batch_idx == 0:
-                _logger.warning("cu_seqlens sequence packing with context_parallel_degree > 1 is not yet supported. Disabling cu_seqlens.")
+            # Disable advanced packing features with CP for now
+            if (position_ids is not None or cu_seqlens_list is not None) and dist.get_rank() == 0 and batch_idx == 0:
+                _logger.warning("Sequence packing with context_parallel_degree > 1 is not fully supported. "
+                               "position_ids and cu_seqlens will be disabled.")
+                position_ids = None
                 cu_seqlens_list = None
                 max_seqlen = None
 
@@ -1113,30 +1089,7 @@ class SageMakerNLPBaseModel(ModelPT):
                     f"(model.max_context_width / model.context_parallel_degree)."
                 )
 
-        return input_ids, attention_mask, labels, cu_seqlens_list, max_seqlen
-
-    def _compute_packed_sequence_loss(self, logits, labels):
-        """
-        Custom loss for packed sequences
-        """
-        shift_logits = logits[..., :-1, :].contiguous()  # Remove last token
-        shift_labels = labels[..., 1:].contiguous()  # Remove first token
-
-        # Get EOS token ID
-        if hasattr(self.trainer.datamodule, 'tokenizer') and self.trainer.datamodule.tokenizer is not None:
-            eos_token_id = self.trainer.datamodule.tokenizer.eos_token_id
-        else:
-            # Default for Llama models
-            eos_token_id = 2
-        loss_mask = (shift_labels != eos_token_id).float()
-
-        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-        loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)),  # Flatten
-            shift_labels.view(-1)
-        )
-        masked_loss = (loss * loss_mask.view(-1)).sum() / loss_mask.sum()
-        return masked_loss
+        return input_ids, attention_mask, labels, position_ids, cu_seqlens_list, max_seqlen
 
     def setup_optimization(
         self,
